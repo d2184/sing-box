@@ -1,0 +1,261 @@
+name: Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      ver:
+        description: 'Release Version: v(?)'
+        required: true
+        type: string
+      bra:
+        description: 'SFA: main or dev ?'
+        required: true
+        default: main
+        type: choice
+        options:
+          - main
+          - dev
+      pre:
+        description: 'Upload Prerelease ?'
+        required: true
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+env: 
+  TZ: Asia/Shanghai
+
+jobs:
+  Clean_Jobs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Workflow runs delete
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          retain_days: 0
+          keep_minimum_runs: 2
+
+  Build_Core:
+    strategy:
+      matrix:
+        include:
+          # windows
+          - name: windows-amd64
+            goos: windows
+            goarch: amd64
+            goamd64: v1
+          - name: windows-amd64-v3
+            goos: windows
+            goarch: amd64
+            goamd64: v3
+          # linux
+          - name: linux-amd64
+            goos: linux
+            goarch: amd64
+            goamd64: v1
+          - name: linux-amd64-v3
+            goos: linux
+            goarch: amd64
+            goamd64: v3
+          # android
+          - name: android-arm64
+            goos: android
+            goarch: arm64
+
+      fail-fast: false
+    runs-on: ubuntu-latest
+    permissions: write-all
+    needs: [Clean_Jobs]
+    env:
+      GOOS: ${{ matrix.goos }}
+      GOARCH: ${{ matrix.goarch }}
+      GOAMD64: ${{ matrix.goamd64 }}
+      TAGS: with_gvisor,with_quic,with_dhcp,with_wireguard,with_ech,with_utls,with_reality_server,with_acme,with_clash_api
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          check-latest: true
+
+      - name: Sync Commit
+        run: |
+          git reset --soft HEAD~1
+        shell: bash
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1.5.0
+        if: ${{ contains(matrix.name, 'android') }}
+        id: setup-ndk
+        with:
+          ndk-version: r26d
+          add-to-path: false
+          local-cache: false
+
+      - name: Build
+        if: ${{ !contains(matrix.name, 'android') }}
+        run: |
+          CGO_ENABLED=1 go build -v -trimpath -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ github.event.inputs.ver }}' -s -w -buildid=" -tags ${{ env.TAGS }} ./cmd/sing-box
+        shell: bash
+
+      - name: Build Android
+        if: ${{ contains(matrix.name, 'android') }}
+        run: |
+          CC=${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang
+          CGO_ENABLED=1 CC=${CC} go build -v -trimpath -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ github.event.inputs.ver }}' -s -w -buildid=" -tags ${{ env.TAGS }} ./cmd/sing-box
+        shell: bash
+
+      - name: Pack
+        if: ${{ !contains(matrix.name, 'windows') }}
+        run: |
+          mkdir -p sing-box-${{ github.event.inputs.ver }}-${{ matrix.name }}
+          mv sing-box sing-box-${{ github.event.inputs.ver }}-${{ matrix.name }}/
+          tar -czvf sing-box-${{ github.event.inputs.ver }}-${{ matrix.name }}.tar.gz sing-box-${{ github.event.inputs.ver }}-${{ matrix.name }}
+        shell: bash
+
+      - name: Pack Windows
+        if: ${{ contains(matrix.name, 'windows') }}
+        run: |
+          mkdir -p sing-box-${{ github.event.inputs.ver }}-${{ matrix.name }}
+          mv sing-box.exe sing-box-${{ github.event.inputs.ver}}-${{ matrix.name }}/
+          zip -r sing-box-${{ github.event.inputs.ver }}-${{ matrix.name }}.zip sing-box-${{ github.event.inputs.ver }}-${{ matrix.name }}
+        shell: bash
+
+      - name: Generate Release Introduction
+        id: write_explain
+        run: |
+          cat > release.txt << 'EOF'
+          TAGs: ${{env.TAGS}}
+          CGO_ENABLED: True
+          EOF
+
+          r=$(cat release.txt)
+          r="${r//'%'/'%25'}"
+          r="${r//$'\n'/'%0A'}"
+          r="${r//$'\r'/'%0D'}"
+          echo "RELEASE_BODY=$r" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Public
+        uses: svenstaro/upload-release-action@master
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          tag: v${{ github.event.inputs.ver }}
+          release_name: ${{ github.event.inputs.ver }}
+          file: sing-box-${{ github.event.inputs.ver }}-${{ matrix.name }}*
+          prerelease: ${{ github.event.inputs.pre }}
+          body: |
+            ${{ steps.write_explain.outputs.RELEASE_BODY }}
+          overwrite: true
+          file_glob: true
+
+  Build_SFA:
+    permissions: write-all
+    runs-on: ubuntu-latest
+    needs: [Clean_Jobs]
+    env:
+      TAGS: with_gvisor,with_quic,with_dhcp,with_wireguard,with_ech,with_utls,with_reality_server,with_acme,with_clash_api
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          check-latest: true
+
+      - name: Set Version
+        run: |
+          tag=${{ github.event.inputs.ver }}
+          sed -i "s/currentTag = \"unknown\"/currentTag = \"${tag}\"/" cmd/internal/build_libbox/main.go
+          echo "BUILD_VERSION=${tag}" >> $GITHUB_ENV
+        shell: bash
+
+      - name: Checkout SFA Repository
+        uses: actions/checkout@v4
+        with:
+          repository: d2184/sing-box-for-android
+          ref: ${{ github.event.inputs.bra }}
+          path: SFA
+          submodules: recursive
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'oracle'
+          java-version: 21
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1.5.0
+        id: setup-ndk
+        with:
+          ndk-version: r26d
+          add-to-path: false
+          local-cache: false
+
+      - name: Sync Commit
+        run: |
+          git reset --soft HEAD~1
+        shell: bash
+
+      - name: Build SFA
+        run: |
+          mkdir -p SFA/app/libs/ SFA/app/build/release/signed
+          make lib_install
+          CGO_ENABLED=1 gomobile bind -v -androidapi 21 -javapkg=io.nekohasekai -libname=box -trimpath -buildvcs=false -ldflags "-X github.com/sagernet/sing-box/constant.Version=${BUILD_VERSION} -s -w -buildid=" -tags ${{ env.TAGS }} ./experimental/libbox
+          cp ./libbox.aar SFA/app/libs/
+          cd SFA || exit 1
+          sed -i '/signingConfigs\.release/d' app/build.gradle
+          echo "VERSION_NAME=${BUILD_VERSION}" > version.properties
+          echo "VERSION_CODE=$(date +%Y%m%d%H)" >> version.properties
+          echo "GO_VERSION=go1.22.3" >> version.properties
+          chmod +x ./gradlew
+          ./gradlew :app:assembleOtherRelease && ./gradlew --stop
+        shell: bash
+
+      - name: Find apk directory
+        run: |
+          find . -name "*.apk" -printf "%p\n"
+        shell: bash
+
+      - name: Sign Apks
+        if: success()
+        uses: d2184/android-sign@main
+        with:
+          releaseDirectory: SFA/app/build/outputs/apk/other/release
+          output: SFA/app/build/release/signed
+          alias: ${{ secrets.KEY_ALIAS }}
+          signingKeyBase64: ${{ secrets.KEYSTORE_CONTENT }}
+          keyStorePassword: ${{ secrets.KEYSTORE_PASSWORD }}
+          keyPassword: ${{ secrets.KEY_PASSWORD }}
+        env:
+          BUILD_TOOLS_VERSION: "34.0.0"
+
+      - name: Rename Apks
+        run: |
+          find SFA/app/build/release/signed -type f -name "*.apk" -exec bash -c '[[ $0 == *"-unsigned"* ]] && mv $0 ${0/-unsigned/}' {} \;
+        shell: bash
+
+      - name: Public
+        uses: svenstaro/upload-release-action@master
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          tag: v${{ github.event.inputs.ver }}
+          release_name: ${{ github.event.inputs.ver }}
+          file: "SFA/app/build/release/signed/*.apk"
+          prerelease: ${{ github.event.inputs.pre }}
+          overwrite: true
+          file_glob: true
