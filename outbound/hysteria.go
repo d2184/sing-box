@@ -23,8 +23,8 @@ import (
 )
 
 var (
-	_ adapter.Outbound                = (*TUIC)(nil)
-	_ adapter.InterfaceUpdateListener = (*TUIC)(nil)
+	_ adapter.Outbound                = (*Hysteria)(nil)
+	_ adapter.InterfaceUpdateListener = (*Hysteria)(nil)
 )
 
 type Hysteria struct {
