@@ -62,6 +62,33 @@ func (m *Manager) Get(tag string) (adapter.Endpoint, bool) {
 	return endpoint, found
 }
 
+func (m *Manager) Remove(tag string) error {
+	m.access.Lock()
+	defer m.access.Unlock()
+
+	endpoint, found := m.endpointByTag[tag]
+	if !found {
+		return E.New("endpoint not found: ", tag)
+	}
+
+	// Remove from map
+	delete(m.endpointByTag, tag)
+
+	// Remove from slice
+	for i, ep := range m.endpoints {
+		if ep.Tag() == tag {
+			m.endpoints = append(m.endpoints[:i], m.endpoints[i+1:]...)
+			break
+		}
+	}
+
+	// Close the endpoint if it implements io.Closer
+	if closer, ok := endpoint.(interface{ Close() error }); ok {
+		return closer.Close()
+	}
+	return nil
+}
+
 func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, outboundType string, options any) error {
 	endpoint, err := m.registry.Create(ctx, router, logger, tag, outboundType, options)
 	if err != nil {

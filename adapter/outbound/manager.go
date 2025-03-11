@@ -166,6 +166,33 @@ func (m *Manager) Default() adapter.Outbound {
 	return m.defaultOutbound
 }
 
+func (m *Manager) Remove(tag string) error {
+	m.access.Lock()
+	defer m.access.Unlock()
+
+	outbound, found := m.outboundByTag[tag]
+	if !found {
+		return E.New("outbound not found: ", tag)
+	}
+
+	// Remove from map
+	delete(m.outboundByTag, tag)
+
+	// Remove from slice
+	for i, ob := range m.outbounds {
+		if ob.Tag() == tag {
+			m.outbounds = append(m.outbounds[:i], m.outbounds[i+1:]...)
+			break
+		}
+	}
+
+	// Close the outbound if it implements io.Closer
+	if closer, ok := outbound.(interface{ Close() error }); ok {
+		return closer.Close()
+	}
+	return nil
+}
+
 func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, inboundType string, options any) error {
 	if tag == "" {
 		return os.ErrInvalid
