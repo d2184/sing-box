@@ -149,6 +149,13 @@ var OptionStoreRDRC = Note{
 	EnvName:           "STORE_RDRC",
 	MigrationLink:     "https://sing-box.sagernet.org/migration/#migrate-store_rdrc",
 }
+var OptionLegacyProviderDownloadDetour = Note{
+	Name:              "legacy-provider-download-detour",
+	Description:       "legacy `download_detour` remote provider option",
+	DeprecatedVersion: "1.14.0",
+	ScheduledVersion:  "1.16.0",
+	EnvName:           "LEGACY_PROVIDER_DOWNLOAD_DETOUR",
+}
 
 var OptionImplicitDefaultHTTPClient = Note{
 	Name:              "implicit-default-http-client",
@@ -178,6 +185,7 @@ var Options = []Note{
 	OptionLegacyDNSRuleStrategy,
 	OptionIndependentDNSCache,
 	OptionStoreRDRC,
+	OptionLegacyProviderDownloadDetour,
 	OptionImplicitDefaultHTTPClient,
 	OptionTunStack,
 }
