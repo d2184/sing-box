@@ -3,6 +3,7 @@ package route
 import (
 	"context"
 	"slices"
+	"sync"
 	"sync/atomic"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -15,7 +16,15 @@ import (
 	"github.com/sagernet/sing/service/pause"
 )
 
-var _ adapter.LifecycleService = (*ReferenceManager)(nil)
+var (
+	_ adapter.LifecycleService               = (*ReferenceManager)(nil)
+	_ adapter.DomainResolverReferenceTracker = (*ReferenceManager)(nil)
+)
+
+type domainResolverKey struct {
+	tag      string
+	endpoint bool
+}
 
 type ReferenceManager struct {
 	ctx                    context.Context
@@ -24,7 +33,8 @@ type ReferenceManager struct {
 	dnsRules               []option.DNSRule
 	staticOutbounds        []string
 	staticTransports       []string
-	domainResolvers        map[string]string
+	domainResolversAccess  sync.RWMutex
+	domainResolvers        map[domainResolverKey]string
 	subscriber             *observable.Subscriber[struct{}]
 	pauseManager           pause.Manager
 	devicePaused           atomic.Bool
@@ -41,17 +51,17 @@ func NewReferenceManager(ctx context.Context, logger log.ContextLogger, options 
 		staticOutbounds = append(staticOutbounds, options.NTP.Detour)
 		staticTransports = append(staticTransports, domainResolverServer(options.NTP.DialerOptions))
 	}
-	domainResolvers := make(map[string]string)
+	domainResolvers := make(map[domainResolverKey]string)
 	for _, outboundOptions := range options.Outbounds {
 		dialerOptionsWrapper, isDialerOptionsWrapper := outboundOptions.Options.(option.DialerOptionsWrapper)
 		if isDialerOptionsWrapper {
-			domainResolvers[outboundOptions.Tag] = domainResolverServer(dialerOptionsWrapper.TakeDialerOptions())
+			domainResolvers[domainResolverKey{tag: outboundOptions.Tag}] = domainResolverServer(dialerOptionsWrapper.TakeDialerOptions())
 		}
 	}
 	for _, endpointOptions := range options.Endpoints {
 		dialerOptionsWrapper, isDialerOptionsWrapper := endpointOptions.Options.(option.DialerOptionsWrapper)
 		if isDialerOptionsWrapper {
-			domainResolvers[endpointOptions.Tag] = domainResolverServer(dialerOptionsWrapper.TakeDialerOptions())
+			domainResolvers[domainResolverKey{tag: endpointOptions.Tag, endpoint: true}] = domainResolverServer(dialerOptionsWrapper.TakeDialerOptions())
 		}
 	}
 	for _, inboundOptions := range options.Inbounds {
@@ -93,19 +103,58 @@ func (m *ReferenceManager) Name() string {
 	return "reference manager"
 }
 
+func (m *ReferenceManager) UpdateDomainResolvers(tag string, isEndpoint bool, rawOptions any) {
+	if tag == "" {
+		return
+	}
+	key := domainResolverKey{tag: tag, endpoint: isEndpoint}
+	var resolver string
+	if options, isDialerOptionsWrapper := rawOptions.(option.DialerOptionsWrapper); isDialerOptionsWrapper {
+		resolver = domainResolverServer(options.TakeDialerOptions())
+	}
+	m.domainResolversAccess.Lock()
+	if resolver != "" {
+		m.domainResolvers[key] = resolver
+	} else {
+		delete(m.domainResolvers, key)
+	}
+	subscriber := m.subscriber
+	m.domainResolversAccess.Unlock()
+	if subscriber != nil {
+		subscriber.Emit(struct{}{})
+	}
+}
+
+func (m *ReferenceManager) RemoveDomainResolvers(tag string, isEndpoint bool) {
+	if tag == "" {
+		return
+	}
+	key := domainResolverKey{tag: tag, endpoint: isEndpoint}
+	m.domainResolversAccess.Lock()
+	delete(m.domainResolvers, key)
+	subscriber := m.subscriber
+	m.domainResolversAccess.Unlock()
+	if subscriber != nil {
+		subscriber.Emit(struct{}{})
+	}
+}
+
 func (m *ReferenceManager) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	if stage != adapter.StartStateStarted {
 		return nil
 	}
-	m.subscriber = observable.NewSubscriber[struct{}](1)
-	scope.Add(m.subscriber.Close)
+	subscriber := observable.NewSubscriber[struct{}](1)
+	m.domainResolversAccess.Lock()
+	m.subscriber = subscriber
+	m.domainResolversAccess.Unlock()
+	scope.Add(subscriber.Close)
 	history := service.PtrFromContext[urltest.HistoryStorage](m.ctx)
 	if history != nil {
-		history.AddUpdateHook(m.subscriber)
+		history.AddUpdateHook(subscriber)
 	}
 	clashMode := service.PtrFromContext[clashmode.Manager](m.ctx)
 	if clashMode != nil {
-		clashMode.AddUpdateHook(m.subscriber)
+		clashMode.AddUpdateHook(subscriber)
 	}
 	if m.pauseManager != nil {
 		m.devicePaused.Store(m.pauseManager.IsDevicePaused())
@@ -122,7 +171,7 @@ func (m *ReferenceManager) Start(stage adapter.StartStage, scope *adapter.Scope)
 			default:
 				return
 			}
-			m.subscriber.Emit(struct{}{})
+			subscriber.Emit(struct{}{})
 		})
 		scope.Add(func() error {
 			m.pauseManager.UnregisterCallback(pauseCallback)
@@ -235,7 +284,11 @@ func (m *ReferenceManager) update() {
 			continue
 		}
 		referencedOutbounds[tag] = true
-		transportQueue = append(transportQueue, m.domainResolvers[tag])
+		_, isEndpoint := outbound.(adapter.Endpoint)
+		m.domainResolversAccess.RLock()
+		resolver := m.domainResolvers[domainResolverKey{tag: tag, endpoint: isEndpoint}]
+		m.domainResolversAccess.RUnlock()
+		transportQueue = append(transportQueue, resolver)
 		outboundReferrer, isOutboundReferrer := outbound.(adapter.Referrer)
 		if isOutboundReferrer {
 			outbounds, dnsServers := outboundReferrer.References()
