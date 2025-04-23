@@ -2,10 +2,12 @@ package rule
 
 import (
 	"context"
+	"io"
 	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/sagernet/fswatch"
 	"github.com/sagernet/sing-box/adapter"
@@ -25,29 +27,32 @@ import (
 var _ adapter.RuleSet = (*LocalRuleSet)(nil)
 
 type LocalRuleSet struct {
-	ctx        context.Context
-	logger     logger.Logger
-	tag        string
-	content    atomic.Pointer[ruleSetContent]
-	fileFormat string
-	watcher    *fswatch.Watcher
-	access     sync.Mutex
-	callbacks  list.List[adapter.RuleSetUpdateCallback]
-	refs       atomic.Int32
+	ctx         context.Context
+	logger      logger.Logger
+	tag         string
+	content     atomic.Pointer[ruleSetContent]
+	fileFormat  string
+	ruleSetType string
+	watcher     *fswatch.Watcher
+	access      sync.Mutex
+	lastUpdated time.Time
+	callbacks   list.List[adapter.RuleSetUpdateCallback]
+	refs        atomic.Int32
 }
 
 func NewLocalRuleSet(ctx context.Context, logger logger.Logger, tag string, options option.RuleSet) (*LocalRuleSet, error) {
 	ruleSet := &LocalRuleSet{
-		ctx:        ctx,
-		logger:     logger,
-		tag:        tag,
-		fileFormat: options.Format,
+		ctx:         ctx,
+		logger:      logger,
+		tag:         tag,
+		fileFormat:  options.Format,
+		ruleSetType: options.Type,
 	}
 	if options.Type == C.RuleSetTypeInline {
 		if len(options.InlineOptions.Rules) == 0 {
 			return nil, E.New("empty inline rule-set")
 		}
-		err := ruleSet.reloadRules(options.InlineOptions.Rules)
+		err := ruleSet.reloadRules(options.InlineOptions.Rules, time.Now())
 		if err != nil {
 			return nil, err
 		}
@@ -79,6 +84,24 @@ func (s *LocalRuleSet) Name() string {
 	return s.tag
 }
 
+func (s *LocalRuleSet) Format() string {
+	return s.fileFormat
+}
+
+func (s *LocalRuleSet) Type() string {
+	return s.ruleSetType
+}
+
+func (s *LocalRuleSet) RuleCount() uint64 {
+	return uint64(len(s.content.Load().rules))
+}
+
+func (s *LocalRuleSet) UpdatedAt() time.Time {
+	s.access.Lock()
+	defer s.access.Unlock()
+	return s.lastUpdated
+}
+
 func (s *LocalRuleSet) String() string {
 	return s.content.Load().String()
 }
@@ -94,10 +117,20 @@ func (s *LocalRuleSet) StartContext(ctx context.Context, startContext *adapter.H
 }
 
 func (s *LocalRuleSet) reloadFile(path string) error {
+	file, err := filemanager.Open(s.ctx, path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	lastUpdated := fileInfo.ModTime()
 	var ruleSet option.PlainRuleSetCompat
 	switch s.fileFormat {
 	case C.RuleSetFormatSource, "":
-		content, err := filemanager.ReadFile(s.ctx, path)
+		content, err := io.ReadAll(file)
 		if err != nil {
 			return err
 		}
@@ -106,19 +139,14 @@ func (s *LocalRuleSet) reloadFile(path string) error {
 			return err
 		}
 	case C.RuleSetFormatBinary:
-		setFile, err := filemanager.Open(s.ctx, path)
-		if err != nil {
-			return err
-		}
-		defer setFile.Close()
-		ruleSet, err = srs.Read(setFile, false)
+		ruleSet, err = srs.Read(file, false)
 		if err != nil {
 			return err
 		}
 	default:
 		return E.New("unknown rule-set format: ", s.fileFormat)
 	}
-	ruleSet, err := mmapRuleSet(s.ctx, s.logger, s.tag, ruleSet)
+	ruleSet, err = mmapRuleSet(s.ctx, s.logger, s.tag, ruleSet)
 	if err != nil {
 		return err
 	}
@@ -126,10 +154,10 @@ func (s *LocalRuleSet) reloadFile(path string) error {
 	if err != nil {
 		return err
 	}
-	return s.reloadRules(plainRuleSet.Rules)
+	return s.reloadRules(plainRuleSet.Rules, lastUpdated)
 }
 
-func (s *LocalRuleSet) reloadRules(headlessRules []option.HeadlessRule) error {
+func (s *LocalRuleSet) reloadRules(headlessRules []option.HeadlessRule, lastUpdated time.Time) error {
 	rules := make([]adapter.HeadlessRule, len(headlessRules))
 	var err error
 	for i, ruleOptions := range headlessRules {
@@ -143,8 +171,9 @@ func (s *LocalRuleSet) reloadRules(headlessRules []option.HeadlessRule) error {
 	if err != nil {
 		return err
 	}
-	s.content.Store(&ruleSetContent{rules: rules, metadata: metadata})
 	s.access.Lock()
+	s.content.Store(&ruleSetContent{rules: rules, metadata: metadata})
+	s.lastUpdated = lastUpdated
 	callbacks := s.callbacks.Array()
 	s.access.Unlock()
 	for _, callback := range callbacks {
