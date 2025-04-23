@@ -5,6 +5,7 @@ import (
 	"net"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	N "github.com/sagernet/sing/common/network"
@@ -45,6 +46,15 @@ func (r *ruleSetItemTestRouter) RuleSet(tag string) (adapter.RuleSet, bool) {
 	ruleSet, loaded := r.ruleSets[tag]
 	return ruleSet, loaded
 }
+
+func (r *ruleSetItemTestRouter) RuleSets() []adapter.RuleSet {
+	ruleSets := make([]adapter.RuleSet, 0, len(r.ruleSets))
+	for _, ruleSet := range r.ruleSets {
+		ruleSets = append(ruleSets, ruleSet)
+	}
+	return ruleSets
+}
+
 func (r *ruleSetItemTestRouter) Rules() []adapter.Rule                      { return nil }
 func (r *ruleSetItemTestRouter) NeedFindProcess() bool                      { return false }
 func (r *ruleSetItemTestRouter) NeedFindNeighbor() bool                     { return false }
@@ -58,8 +68,11 @@ type countingRuleSet struct {
 	refs atomic.Int32
 }
 
-func (s *countingRuleSet) Name() string { return s.name }
-
+func (s *countingRuleSet) Name() string                                                  { return s.name }
+func (s *countingRuleSet) Type() string                                                  { return "local" }
+func (s *countingRuleSet) Format() string                                                { return "binary" }
+func (s *countingRuleSet) RuleCount() uint64                                             { return 0 }
+func (s *countingRuleSet) UpdatedAt() time.Time                                          { return time.Time{} }
 func (s *countingRuleSet) StartContext(context.Context, *adapter.HTTPStartContext) error { return nil }
 
 func (s *countingRuleSet) PostStart() error { return nil }
