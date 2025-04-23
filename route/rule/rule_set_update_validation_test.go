@@ -5,6 +5,7 @@ import (
 	"os"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
@@ -57,7 +58,7 @@ func TestLocalRuleSetReloadRulesRejectsInvalidUpdateBeforeCommit(t *testing.T) {
 		DefaultOptions: option.DefaultHeadlessRule{
 			Domain: badoption.Listable[string]{"example.com"},
 		},
-	}})
+	}}, time.Now())
 	require.NoError(t, err)
 	require.Equal(t, int32(1), callbackCount.Load())
 	require.False(t, ruleSet.metadata.ContainsDNSQueryTypeRule)
@@ -68,7 +69,7 @@ func TestLocalRuleSetReloadRulesRejectsInvalidUpdateBeforeCommit(t *testing.T) {
 		DefaultOptions: option.DefaultHeadlessRule{
 			QueryType: badoption.Listable[option.DNSQueryType]{option.DNSQueryType(1)},
 		},
-	}})
+	}}, time.Now())
 	require.ErrorContains(t, err, "dns conflict")
 	require.Equal(t, int32(1), callbackCount.Load())
 	require.False(t, ruleSet.metadata.ContainsDNSQueryTypeRule)
