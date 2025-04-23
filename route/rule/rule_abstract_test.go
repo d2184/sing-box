@@ -3,6 +3,7 @@ package rule
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
@@ -18,6 +19,22 @@ type fakeRuleSet struct {
 
 func (f *fakeRuleSet) Name() string {
 	return "fake-rule-set"
+}
+
+func (f *fakeRuleSet) Type() string {
+	return "remote"
+}
+
+func (f *fakeRuleSet) Format() string {
+	return "binary"
+}
+
+func (f *fakeRuleSet) RuleCount() uint64 {
+	return 0
+}
+
+func (f *fakeRuleSet) UpdatedAt() time.Time {
+	return time.Now().Local()
 }
 
 func (f *fakeRuleSet) StartContext(context.Context, *adapter.HTTPStartContext) error {
