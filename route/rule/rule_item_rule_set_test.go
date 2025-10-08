@@ -56,6 +56,7 @@ func (r *ruleSetItemTestRouter) RuleSets() []adapter.RuleSet {
 }
 
 func (r *ruleSetItemTestRouter) Rules() []adapter.Rule                      { return nil }
+func (r *ruleSetItemTestRouter) Rule(string) (adapter.Rule, bool)           { return nil, false }
 func (r *ruleSetItemTestRouter) NeedFindProcess() bool                      { return false }
 func (r *ruleSetItemTestRouter) NeedFindNeighbor() bool                     { return false }
 func (r *ruleSetItemTestRouter) NeighborResolver() adapter.NeighborResolver { return nil }
