@@ -1454,6 +1454,12 @@ func addressLimitResponseCheck(rule adapter.DNSRule, metadata *adapter.InboundCo
 	}
 }
 
+func (r *Router) Rules() []adapter.DNSRule {
+	r.rulesAccess.RLock()
+	defer r.rulesAccess.RUnlock()
+	return r.rules
+}
+
 func (r *Router) ClearCache() {
 	r.client.ClearCache()
 	if r.platformInterface != nil {
