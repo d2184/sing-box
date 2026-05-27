@@ -430,16 +430,18 @@ func clashMemoryBytes(value int) byteformats.MemoryBytes {
 }
 
 type Hysteria2Option struct {
-	DialerOptions `yaml:",inline"`
-	ServerOptions `yaml:",inline"`
-	TLSOptions    `yaml:",inline"`
-	Ports         string `yaml:"ports,omitempty"`
-	HopInterval   int    `yaml:"hop-interval,omitempty"`
-	Up            string `yaml:"up,omitempty"`
-	Down          string `yaml:"down,omitempty"`
-	Password      string `yaml:"password,omitempty"`
-	Obfs          string `yaml:"obfs,omitempty"`
-	ObfsPassword  string `yaml:"obfs-password,omitempty"`
+	DialerOptions     `yaml:",inline"`
+	ServerOptions     `yaml:",inline"`
+	TLSOptions        `yaml:",inline"`
+	Ports             string `yaml:"ports,omitempty"`
+	HopInterval       int    `yaml:"hop-interval,omitempty"`
+	Up                string `yaml:"up,omitempty"`
+	Down              string `yaml:"down,omitempty"`
+	Password          string `yaml:"password,omitempty"`
+	Obfs              string `yaml:"obfs,omitempty"`
+	ObfsPassword      string `yaml:"obfs-password,omitempty"`
+	ObfsMinPacketSize int    `yaml:"obfs-min-packet-size,omitempty"`
+	ObfsMaxPacketSize int    `yaml:"obfs-max-packet-size,omitempty"`
 }
 
 func (h *Hysteria2Option) Build() any {
@@ -451,7 +453,7 @@ func (h *Hysteria2Option) Build() any {
 		HopInterval:                 badoption.Duration(h.HopInterval),
 		UpMbps:                      clashSpeedToIntMbps(h.Up),
 		DownMbps:                    clashSpeedToIntMbps(h.Down),
-		Obfs:                        clashHysteria2Obfs(h.Obfs, h.ObfsPassword),
+		Obfs:                        clashHysteria2Obfs(h.Obfs, h.ObfsPassword, h.ObfsMinPacketSize, h.ObfsMaxPacketSize),
 		Password:                    h.Password,
 		OutboundTLSOptionsContainer: clashTLSOptions(h.Server, &h.TLSOptions),
 	}
@@ -868,13 +870,17 @@ func clashHeaders(headers map[string]string) map[string]badoption.Listable[strin
 	return result
 }
 
-func clashHysteria2Obfs(obfs string, password string) *option.Hysteria2Obfs {
+func clashHysteria2Obfs(obfs string, password string, minPacketSize int, maxPacketSize int) *option.Hysteria2Obfs {
 	if obfs == "" {
 		return nil
 	}
 	return &option.Hysteria2Obfs{
 		Type:     obfs,
 		Password: password,
+		GeckoOptions: option.Hysteria2ObfsGecko{
+			MinPacketSize: minPacketSize,
+			MaxPacketSize: maxPacketSize,
+		},
 	}
 }
 
