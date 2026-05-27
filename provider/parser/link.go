@@ -688,12 +688,21 @@ func parseHysteria2Link(link string) (option.Outbound, error) {
 		case "mport":
 			options.ServerPorts = clashPorts(value)
 		case "obfs":
-			if value == "salamander" {
+			switch value {
+			case "salamander":
 				Obfs.Type = "salamander"
+			case "gecko":
+				Obfs.Type = "gecko"
+			}
+			if Obfs.Type != "" {
 				options.Obfs = Obfs
 			}
 		case "obfs-password":
 			Obfs.Password = value
+		case "obfs-min-packet-size":
+			Obfs.GeckoOptions.MinPacketSize, _ = strconv.Atoi(value)
+		case "obfs-max-packet-size":
+			Obfs.GeckoOptions.MaxPacketSize, _ = strconv.Atoi(value)
 		case "sni":
 			TLSOptions.ServerName = value
 		case "insecure", "skip-cert-verify":
