@@ -1,7 +1,6 @@
 package remote
 
 import (
-	"bytes"
 	"context"
 	"io"
 	"net/http"
@@ -23,13 +22,14 @@ import (
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	F "github.com/sagernet/sing/common/format"
-	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/service"
 )
 
 func RegisterProvider(registry *provider.Registry) {
 	provider.Register[option.ProviderRemoteOptions](registry, C.ProviderTypeRemote, NewProviderRemote)
 }
+
+var infoRegexp = regexp.MustCompile(`(upload|download|total|expire)[\s\t]*=[\s\t]*(-?\d*);?`)
 
 var _ adapter.Provider = (*ProviderRemote)(nil)
 
@@ -144,11 +144,14 @@ func (s *ProviderRemote) StartContext(ctx context.Context, startContext *adapter
 }
 
 func (s *ProviderRemote) Update() error {
+	ctx := interrupt.ContextWithIsProviderConnection(s.ctx)
+	if err := s.fetch(ctx, false); err != nil {
+		return err
+	}
 	if s.ticker != nil {
 		s.ticker.Reset(s.updateInterval)
 	}
-	ctx := interrupt.ContextWithIsProviderConnection(s.ctx)
-	return s.fetch(ctx, false)
+	return nil
 }
 
 func (s *ProviderRemote) UpdatedAt() time.Time {
@@ -223,23 +226,28 @@ func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
 	if err != nil {
 		return err
 	}
+	defer resp.Body.Close()
 	infoStr := resp.Header.Get("subscription-userinfo")
 	info, hasInfo := parseInfo(infoStr)
 	switch resp.StatusCode {
 	case http.StatusOK:
 	case http.StatusNotModified:
 		s.infoMu.Lock()
-		s.subscriptionInfo = info
+		if hasInfo {
+			s.subscriptionInfo = info
+		}
 		s.lastUpdated = time.Now()
 		s.infoMu.Unlock()
 		if s.cacheFile != nil {
 			saveSub := s.cacheFile.LoadSubscription(s.Tag())
 			if saveSub != nil {
 				if hasInfo {
-					index := bytes.IndexByte(saveSub.Content, '\n')
-					if index != -1 {
-						saveSub.Content = append([]byte(infoStr+"\n"), saveSub.Content[index+1:]...)
+					content := string(saveSub.Content)
+					firstLine, others := getFirstLine(content)
+					if _, ok := parseInfo(firstLine); ok {
+						content = others
 					}
+					saveSub.Content = []byte(infoStr + "\n" + content)
 				}
 				saveSub.LastUpdated = s.lastUpdated
 				err := s.cacheFile.SaveSubscription(s.Tag(), saveSub)
@@ -253,17 +261,11 @@ func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
 	default:
 		return E.New("unexpected status: ", resp.Status)
 	}
-	defer resp.Body.Close()
 	contentRaw, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
 	}
 	eTagHeader := resp.Header.Get("Etag")
-	if eTagHeader != "" {
-		s.infoMu.Lock()
-		s.lastEtag = eTagHeader
-		s.infoMu.Unlock()
-	}
 	content, _ := parser.DecodeBase64URLSafe(string(contentRaw))
 	if !hasInfo {
 		firstLine, others := getFirstLine(content)
@@ -275,22 +277,24 @@ func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
 	if err := s.updateProviderFromContent(content); err != nil {
 		return err
 	}
+	if eTagHeader != "" {
+		s.infoMu.Lock()
+		s.lastEtag = eTagHeader
+		s.infoMu.Unlock()
+	}
 	s.UpdateGroups()
 	s.infoMu.Lock()
 	s.subscriptionInfo = info
 	s.lastUpdated = time.Now()
 	s.infoMu.Unlock()
 	if s.cacheFile != nil {
-		content, _ := json.Marshal(option.Options{
-			Outbounds: s.lastOutOpts,
-			Endpoints: s.lastEPOpts,
-		})
+		cacheContent := content
 		if hasInfo {
-			content = append([]byte(infoStr+"\n"), content...)
+			cacheContent = infoStr + "\n" + cacheContent
 		}
 		err = s.cacheFile.SaveSubscription(s.Tag(), &adapter.SavedBinary{
 			LastUpdated: s.lastUpdated,
-			Content:     content,
+			Content:     []byte(cacheContent),
 			LastEtag:    s.lastEtag,
 		})
 		if err != nil {
@@ -318,42 +322,48 @@ func (s *ProviderRemote) loopUpdate() {
 		s.ticker.Reset(s.updateInterval)
 	}
 	for {
-		runtime.GC()
 		select {
 		case <-s.ctx.Done():
 			return
 		case <-s.ticker.C:
 			s.updateOnce()
+			runtime.GC()
 			s.ticker.Reset(s.updateInterval)
 		}
 	}
 }
 
 func (s *ProviderRemote) updateProviderFromContent(content string) error {
-	outboundOpts, endpointOpts, err := parser.ParseSubscription(s.ctx, content, s.overrideDialer, s.Tag())
+	outboundOpts, endpointOpts, err := parser.ParseSubscription(s.ctx, content)
 	if err != nil {
 		return err
 	}
-	outboundOpts = common.Filter(outboundOpts, func(it option.Outbound) bool {
-		return (s.exclude == nil || !s.exclude.MatchString(it.Tag)) && (s.include == nil || s.include.MatchString(it.Tag))
-	})
-	endpointOpts = common.Filter(endpointOpts, func(it option.Endpoint) bool {
-		return (s.exclude == nil || !s.exclude.MatchString(it.Tag)) && (s.include == nil || s.include.MatchString(it.Tag))
-	})
+	outboundOpts, endpointOpts = s.filterOptions(outboundOpts, endpointOpts)
+	outboundOpts, endpointOpts = parser.ApplyOverrideDialer(outboundOpts, endpointOpts, s.overrideDialer, s.Tag())
+	s.applyOptions(outboundOpts, endpointOpts)
+	return nil
+}
+
+func (s *ProviderRemote) filterOptions(outboundOpts []option.Outbound, endpointOpts []option.Endpoint) ([]option.Outbound, []option.Endpoint) {
+	matchTag := func(tag string) bool {
+		return (s.exclude == nil || !s.exclude.MatchString(tag)) && (s.include == nil || s.include.MatchString(tag))
+	}
+	outboundOpts = common.Filter(outboundOpts, func(it option.Outbound) bool { return matchTag(it.Tag) })
+	endpointOpts = common.Filter(endpointOpts, func(it option.Endpoint) bool { return matchTag(it.Tag) })
+	return outboundOpts, endpointOpts
+}
+
+func (s *ProviderRemote) applyOptions(outboundOpts []option.Outbound, endpointOpts []option.Endpoint) {
 	s.UpdateOutbounds(s.lastOutOpts, outboundOpts)
 	s.lastOutOpts = outboundOpts
 	s.UpdateEndpoints(s.lastEPOpts, endpointOpts)
 	s.lastEPOpts = endpointOpts
-	return nil
+	s.TriggerHealthCheck()
 }
 
 func getFirstLine(content string) (string, string) {
-	lines := strings.Split(content, "\n")
-	if len(lines) == 1 {
-		return lines[0], ""
-	}
-	others := strings.Join(lines[1:], "\n")
-	return lines[0], others
+	first, rest, _ := strings.Cut(content, "\n")
+	return first, rest
 }
 
 func parseInfo(infoStr string) (adapter.SubscriptionInfo, bool) {
@@ -361,8 +371,7 @@ func parseInfo(infoStr string) (adapter.SubscriptionInfo, bool) {
 	if infoStr == "" {
 		return info, false
 	}
-	reg := regexp.MustCompile(`(upload|download|total|expire)[\s\t]*=[\s\t]*(-?\d*);?`)
-	matches := reg.FindAllStringSubmatch(infoStr, 4)
+	matches := infoRegexp.FindAllStringSubmatch(infoStr, 4)
 	if len(matches) == 0 {
 		return info, false
 	}
