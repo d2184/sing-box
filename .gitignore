@@ -20,5 +20,6 @@
 /config.d/
 /venv/
 CLAUDE.md
+CLAUDE.local.md
 AGENTS.md
 /.claude/
