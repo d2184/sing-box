@@ -1,0 +1,540 @@
+name: Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release Version: v(?)'
+        required: true
+        type: string
+      branch:
+        description: 'SFA: main or dev ?'
+        required: true
+        default: dev
+        type: choice
+        options:
+          - main
+          - dev
+      release_type:
+        description: 'Release Type ?'
+        required: true
+        default: prerelease
+        type: choice
+        options:
+          - prerelease
+          - release
+          - artifact
+
+env:
+  TZ: Asia/Shanghai
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  Clean_Jobs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Workflow runs delete
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          retain_days: 3
+          keep_minimum_runs: 1
+
+  Build_Core:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        include:
+          # linux
+          - { os: linux, arch: amd64, variant: purego, naive: true }
+          - { os: linux, arch: amd64, variant: glibc, naive: true }
+          - { os: linux, arch: amd64, variant: musl, naive: true }
+
+          # android
+          - { os: android, arch: arm64, ndk: "aarch64-linux-android23" }
+    
+    needs: [Clean_Jobs]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          check-latest: true
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        if: matrix.os == 'android'
+        id: setup-ndk
+        with:
+          ndk-version: r28
+          add-to-path: true
+
+      - name: Clone cronet-go
+        if: matrix.naive && matrix.variant != 'purego'
+        run: |
+          set -xeuo pipefail
+          CRONET_GO_VERSION=$(cat .github/CRONET_GO_VERSION)
+          git init ~/cronet-go
+          git -C ~/cronet-go remote add origin https://github.com/sagernet/cronet-go.git
+          git -C ~/cronet-go sparse-checkout set --no-cone '/*' '!/lib'
+          git -C ~/cronet-go fetch --depth=1 --filter=blob:none origin "$CRONET_GO_VERSION"
+          git -C ~/cronet-go checkout FETCH_HEAD
+          git -C ~/cronet-go submodule update --init --recursive --depth=1
+
+      - name: Regenerate Debian keyring
+        if: matrix.naive && matrix.variant != 'purego'
+        run: |
+          set -xeuo pipefail
+          rm -f ~/cronet-go/naiveproxy/src/build/linux/sysroot_scripts/keyring.gpg
+          cd ~/cronet-go
+          GPG_TTY=/dev/null ./naiveproxy/src/build/linux/sysroot_scripts/generate_keyring.sh
+
+      - name: Cache Chromium toolchain
+        if: matrix.naive && matrix.variant != 'purego'
+        id: cache-chromium-toolchain
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/cronet-go/naiveproxy/src/third_party/llvm-build/
+            ~/cronet-go/naiveproxy/src/gn/out/
+            ~/cronet-go/naiveproxy/src/chrome/build/pgo_profiles/
+            ~/cronet-go/naiveproxy/src/out/sysroot-build/
+          key: chromium-toolchain-linux-${{ matrix.arch }}-${{ hashFiles('.github/CRONET_GO_VERSION') }}
+
+      - name: Download Chromium toolchain
+        if: matrix.naive && matrix.variant != 'purego'
+        run: |
+          set -xeuo pipefail
+          cd ~/cronet-go
+          if [[ "${{ matrix.variant }}" == "musl" ]]; then
+            go run ./cmd/build-naive --target=linux/${{ matrix.arch }} --libc=musl download-toolchain
+          else
+            go run ./cmd/build-naive --target=linux/${{ matrix.arch }} download-toolchain
+          fi
+
+      - name: Set Chromium toolchain environment
+        if: matrix.naive && matrix.variant != 'purego'
+        run: |
+          set -xeuo pipefail
+          cd ~/cronet-go
+          if [[ "${{ matrix.variant }}" == "musl" ]]; then
+            go run ./cmd/build-naive --target=linux/${{ matrix.arch }} --libc=musl env >> $GITHUB_ENV
+          else
+            go run ./cmd/build-naive --target=linux/${{ matrix.arch }} env >> $GITHUB_ENV
+          fi
+
+      - name: Set build tags
+        run: |
+          set -xeuo pipefail
+          if [[ "${{ matrix.naive }}" == "true" ]]; then
+            TAGS=$(cat release/DEFAULT_BUILD_TAGS)
+          else
+            TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS)
+          fi
+          if [[ "${{ matrix.variant }}" == "purego" ]]; then
+            TAGS="${TAGS},with_purego"
+          elif [[ "${{ matrix.variant }}" == "musl" ]]; then
+            TAGS="${TAGS},with_musl"
+          fi
+          TAGS="${TAGS},with_provider"
+          echo "BUILD_TAGS=${TAGS}" >> "${GITHUB_ENV}"
+
+      - name: Set shared ldflags
+        run: |
+          echo "LDFLAGS_SHARED=$(cat release/LDFLAGS)" >> "${GITHUB_ENV}"
+
+      - name: Set variables
+        run: |
+          GO_VERSION=$(go version | awk '{print $3}' | sed 's/go//')
+          echo "GO_VERSION=$GO_VERSION" >> $GITHUB_ENV
+
+      - name: Build (purego)
+        if: matrix.variant == 'purego'
+        run: |
+          set -xeuo pipefail
+          mkdir -p dist
+          go build -v -trimpath -o dist/sing-box -tags "${{ env.BUILD_TAGS }}" \
+          -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ github.event.inputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+          ./cmd/sing-box
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          GOARM: ${{ matrix.goarm }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract libcronet.so
+        if: matrix.variant == 'purego' && matrix.naive
+        run: |
+          set -xeuo pipefail
+          CRONET_GO_VERSION=$(cat .github/CRONET_GO_VERSION)
+          LIBRARY_PATH="lib/${{ matrix.os }}_${{ matrix.arch }}/libcronet.so"
+          git init "$RUNNER_TEMP/cronet-go-lib"
+          git -C "$RUNNER_TEMP/cronet-go-lib" remote add origin https://github.com/sagernet/cronet-go.git
+          git -C "$RUNNER_TEMP/cronet-go-lib" sparse-checkout set --no-cone "/$LIBRARY_PATH"
+          git -C "$RUNNER_TEMP/cronet-go-lib" fetch --depth=1 --filter=blob:none origin "$CRONET_GO_VERSION"
+          git -C "$RUNNER_TEMP/cronet-go-lib" checkout FETCH_HEAD
+          cp "$RUNNER_TEMP/cronet-go-lib/$LIBRARY_PATH" dist/
+
+      - name: Build (glibc)
+        if: matrix.variant == 'glibc'
+        run: |
+          set -xeuo pipefail
+          mkdir -p dist
+          go build -v -trimpath -o dist/sing-box -tags "${{ env.BUILD_TAGS }}" \
+          -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ github.event.inputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+          ./cmd/sing-box
+        env:
+          CGO_ENABLED: "1"
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          GOARM: ${{ matrix.goarm }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build (musl)
+        if: matrix.variant == 'musl'
+        run: |
+          set -xeuo pipefail
+          mkdir -p dist
+          go build -v -trimpath -o dist/sing-box -tags "${{ env.BUILD_TAGS }}" \
+          -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ github.event.inputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+          ./cmd/sing-box
+        env:
+          CGO_ENABLED: "1"
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          GOARM: ${{ matrix.goarm }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Android
+        if: matrix.os == 'android'
+        run: |
+          set -xeuo pipefail
+          CC='${{ env.ANDROID_NDK_HOME }}/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.ndk }}-clang'
+          CXX="${CC}++"
+          mkdir -p dist
+          GOOS=$BUILD_GOOS GOARCH=$BUILD_GOARCH CC=$CC CXX=$CXX go build -v -trimpath -o dist/sing-box -tags "${{ env.BUILD_TAGS }}" \
+          -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ github.event.inputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+          ./cmd/sing-box
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          CGO_ENABLED: "1"
+          BUILD_GOOS: ${{ matrix.os }}
+          BUILD_GOARCH: ${{ matrix.arch }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pack
+        run: |
+          DIR_NAME="sing-box-${{ github.event.inputs.version }}-${{ matrix.os }}-${{ matrix.arch }}"
+          if [[ "${{ matrix.variant }}" == "glibc" ]]; then
+            DIR_NAME="${DIR_NAME}-glibc"
+          elif [[ "${{ matrix.variant }}" == "musl" ]]; then
+            DIR_NAME="${DIR_NAME}-musl"
+          fi
+
+          mkdir -p "${DIR_NAME}"
+          if [ -f dist/libcronet.so ]; then
+            cp dist/libcronet.so "${DIR_NAME}"
+          fi
+          mv dist/sing-box "${DIR_NAME}/"
+          tar -czvf "${DIR_NAME}.tar.gz" "${DIR_NAME}"
+          rm -rf "${DIR_NAME}"
+
+      - name: Generate Release Introduction
+        id: write_explain
+        run: |
+          cat > release.txt << 'EOF'
+          See https://github.com/SagerNet/sing-box/releases/tag/v${{ github.event.inputs.version }}
+          go version: ${{env.GO_VERSION}}
+          EOF
+
+          r=$(cat release.txt)
+          r="${r//'%'/'%25'}"
+          r="${r//$'\n'/'%0A'}"
+          r="${r//$'\r'/'%0D'}"
+          echo "RELEASE_BODY=$r" >> $GITHUB_OUTPUT
+
+      - name: Public
+        if: ${{ github.event.inputs.release_type != 'artifact' }}
+        uses: svenstaro/upload-release-action@master
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          tag: v${{ github.event.inputs.version }}
+          release_name: ${{ github.event.inputs.version }}
+          file: "sing-box*"
+          prerelease: ${{ github.event.inputs.release_type == 'prerelease' }}
+          body: |
+            ${{ steps.write_explain.outputs.RELEASE_BODY }}
+          overwrite: true
+          file_glob: true
+
+      - name: Upload Artifact
+        if: ${{ github.event.inputs.release_type == 'artifact' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: sing-box-${{ github.event.inputs.version }}-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.variant && format('-{0}', matrix.variant) || '' }}
+          path: "sing-box*"
+
+  Build_Windows:
+    permissions:
+      contents: write
+    runs-on: windows-latest
+    needs: [Clean_Jobs]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          check-latest: true
+
+      - name: Build
+        run: |
+          $TAGS = Get-Content release/DEFAULT_BUILD_TAGS_WINDOWS
+          $LDFLAGS_SHARED = Get-Content release/LDFLAGS
+          mkdir -p dist
+          go build -v -trimpath -o dist/sing-box.exe -tags "$TAGS,with_provider" `
+          -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ github.event.inputs.version }}' $LDFLAGS_SHARED -s -w -buildid=" `
+          ./cmd/sing-box
+        env:
+          CGO_ENABLED: "0"
+          GOOS: windows
+          GOARCH: amd64
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract libcronet.dll
+        run: |
+          $CRONET_GO_VERSION = Get-Content .github/CRONET_GO_VERSION
+          $LIBRARY_PATH = "lib/windows_amd64/libcronet.dll"
+          git init "$env:RUNNER_TEMP/cronet-go-lib"
+          git -C "$env:RUNNER_TEMP/cronet-go-lib" remote add origin https://github.com/sagernet/cronet-go.git
+          git -C "$env:RUNNER_TEMP/cronet-go-lib" sparse-checkout set --no-cone "/$LIBRARY_PATH"
+          git -C "$env:RUNNER_TEMP/cronet-go-lib" fetch --depth=1 --filter=blob:none origin "$CRONET_GO_VERSION"
+          git -C "$env:RUNNER_TEMP/cronet-go-lib" checkout FETCH_HEAD
+          Copy-Item "$env:RUNNER_TEMP/cronet-go-lib/$LIBRARY_PATH" dist
+
+      - name: Pack
+        run: |
+          $DIR_NAME = "sing-box-${{ github.event.inputs.version }}-windows-amd64"
+          mkdir "dist/$DIR_NAME"
+          Copy-Item "dist/sing-box.exe" "dist/$DIR_NAME"
+          Copy-Item "dist/libcronet.dll" "dist/$DIR_NAME"
+          Compress-Archive -Path "dist/$DIR_NAME" -DestinationPath "dist/$DIR_NAME.zip"
+
+      - name: Public
+        if: ${{ github.event.inputs.release_type != 'artifact' }}
+        uses: svenstaro/upload-release-action@master
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          tag: v${{ github.event.inputs.version }}
+          release_name: ${{ github.event.inputs.version }}
+          file: "dist/sing-box*.zip"
+          prerelease: ${{ github.event.inputs.release_type == 'prerelease' }}
+          overwrite: true
+          file_glob: true
+
+      - name: Upload Artifact
+        if: ${{ github.event.inputs.release_type == 'artifact' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: sing-box-${{ github.event.inputs.version }}-windows-amd64
+          path: "dist/sing-box*.zip"
+
+  Build_AAR:
+    runs-on: ubuntu-latest
+    needs: [Clean_Jobs]
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, arm, amd64, "386"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          check-latest: true
+
+      - name: Set Version
+        run: |
+          version=${{ github.event.inputs.version }}
+          sed -i "s/currentTag = \"unknown\"/currentTag = \"${version}\"/" cmd/internal/build_libbox/main.go
+          echo "BUILD_VERSION=${version}" >> $GITHUB_ENV
+
+      - name: Set build tags
+        run: |
+          set -xeuo pipefail
+          TAGS=$(cat release/DEFAULT_BUILD_TAGS)
+          TAGS="${TAGS},with_provider"
+          TAGS="${TAGS},ts_omit_logtail,ts_omit_ssh,ts_omit_drive,ts_omit_taildrop,ts_omit_webclient,ts_omit_doctor,ts_omit_capture,ts_omit_kube,ts_omit_aws,ts_omit_synology,ts_omit_bird"
+          echo "BUILD_TAGS=${TAGS}" >> "${GITHUB_ENV}"
+
+      - name: Set shared ldflags
+        run: |
+          echo "LDFLAGS_SHARED=$(cat release/LDFLAGS)" >> "${GITHUB_ENV}"
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r28
+
+      - name: Build library
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          set -xeuo pipefail
+          make lib_install
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          CGO_ENABLED=1 gomobile bind -v -o libbox.aar -target android/${{ matrix.arch }} -androidapi 24 -javapkg=io.nekohasekai \
+          -libname=box -trimpath -buildvcs=false -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ env.BUILD_VERSION }}' \
+          ${LDFLAGS_SHARED} -s -w -buildid=" -tags ${{ env.BUILD_TAGS }} ./experimental/libbox
+
+      - name: Upload AAR
+        uses: actions/upload-artifact@v7
+        with:
+          name: libbox-${{ matrix.arch }}
+          path: libbox.aar
+          compression-level: 0
+
+  Build_SFA:
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    needs: [Clean_Jobs, Build_AAR]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Checkout Android client
+        run: git submodule update --init clients/android
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          check-latest: true
+
+      - name: Checkout main branch
+        if: ${{ github.event.inputs.branch == 'main' }}
+        run: |-
+          cd clients/android
+          git checkout main
+
+      - name: Checkout dev branch
+        if: ${{ github.event.inputs.branch == 'dev' }}
+        run: |-
+          cd clients/android
+          git checkout dev
+
+      - name: Set Version
+        run: |
+          version=${{ github.event.inputs.version }}
+          echo "BUILD_VERSION=${version}" >> $GITHUB_ENV
+          GO_VERSION=$(go version | awk '{print $3}' | sed 's/go//')
+          echo "GO_VERSION=$GO_VERSION" >> $GITHUB_ENV
+
+      - name: Setup OpenJDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r28
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-provider: basic
+
+      - name: Download AARs
+        uses: actions/download-artifact@v8
+        with:
+          pattern: libbox-*
+          path: aars
+
+      - name: Merge AARs
+        run: |
+          set -xeuo pipefail
+          go run ./cmd/internal/merge_aar -output libbox.aar aars/libbox-*/libbox.aar
+
+      - name: Build SFA
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          cd ./clients/android
+          echo "BUILD_BRANCH=${{ github.event.inputs.branch }}-$(git rev-parse --short=7 HEAD)"
+          mkdir -p ./app/libs
+          cp ../../libbox.aar ./app/libs
+          sed -i '/signingConfigs\.getByName/d' app/build.gradle.kts
+          echo "VERSION_NAME=${BUILD_VERSION}" > version.properties
+          echo "VERSION_CODE=$(date +%Y%m%d%H)" >> version.properties
+          echo "GO_VERSION=go${GO_VERSION}" >> version.properties
+          chmod +x ./gradlew
+          ./gradlew --build-cache --parallel :app:assembleOtherRelease
+
+      - name: Find apk directory
+        run: |
+          find . -name "*.apk" -printf "%p\n"
+
+      - name: Sign Apks
+        if: success()
+        uses: d2184/android-sign@main
+        with:
+          releaseDirectory: ./clients/android/app/build/outputs/apk/other/release/
+          output: ./clients/android/app/build/outputs/apk/other/release/signed
+          alias: ${{ secrets.KEY_ALIAS }}
+          signingKeyBase64: ${{ secrets.KEYSTORE_CONTENT }}
+          keyStorePassword: ${{ secrets.KEYSTORE_PASSWORD }}
+          keyPassword: ${{ secrets.KEY_PASSWORD }}
+        env:
+          BUILD_TOOLS_VERSION: "35.0.0"
+
+      - name: Rename Apks
+        run: |
+          find ./clients/android/app/build/outputs/apk/other/release/signed -type f -name "*-unsigned.apk" -exec bash -c 'mv "$0" "${0/-unsigned.apk/.apk}"' {} \;
+
+      - name: Public
+        if: ${{ github.event.inputs.release_type != 'artifact' }}
+        uses: svenstaro/upload-release-action@master
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          tag: v${{ github.event.inputs.version }}
+          release_name: ${{ github.event.inputs.version }}
+          file: "./clients/android/app/build/outputs/apk/other/release/signed/*.apk"
+          prerelease: ${{ github.event.inputs.release_type == 'prerelease' }}
+          overwrite: true
+          file_glob: true
+
+      - name: Upload Artifact
+        if: ${{ github.event.inputs.release_type == 'artifact' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: SFA-${{ github.event.inputs.version }}-${{ github.event.inputs.branch }}
+          path: "./clients/android/app/build/outputs/apk/other/release/signed/*.apk"
