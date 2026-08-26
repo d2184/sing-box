@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"testing"
 
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 
 	"github.com/stretchr/testify/require"
@@ -17,6 +18,36 @@ func TestParseVMessLinkSNI(t *testing.T) {
 	options := outbound.Options.(*option.VMessOutboundOptions)
 	require.Equal(t, "192.0.2.1", options.Server)
 	require.Equal(t, "example.com", options.TLS.ServerName)
+}
+
+func TestParseVMessLinkURLStyle(t *testing.T) {
+	outbound, err := ParseSubscriptionLink("vmess://11111111-1111-1111-1111-111111111111@192.0.2.1:443?type=tcp#test")
+	require.NoError(t, err)
+
+	require.Equal(t, "test", outbound.Tag)
+	options := outbound.Options.(*option.VMessOutboundOptions)
+	require.Equal(t, "192.0.2.1", options.Server)
+	require.Equal(t, uint16(443), options.ServerPort)
+	require.Equal(t, "11111111-1111-1111-1111-111111111111", options.UUID)
+}
+
+func TestParseVMessLinkURLStyleWebsocket(t *testing.T) {
+	outbound, err := ParseSubscriptionLink("vmess://11111111-1111-1111-1111-111111111111@192.0.2.1:443?type=ws&host=example.com&path=/ws")
+	require.NoError(t, err)
+
+	options := outbound.Options.(*option.VMessOutboundOptions)
+	require.NotNil(t, options.Transport)
+	require.Equal(t, C.V2RayTransportTypeWebsocket, options.Transport.Type)
+	require.Equal(t, "/ws", options.Transport.WebsocketOptions.Path)
+}
+
+func TestParseVMessLinkURLStyleGRPC(t *testing.T) {
+	outbound, err := ParseSubscriptionLink("vmess://11111111-1111-1111-1111-111111111111@192.0.2.1:443?type=grpc")
+	require.NoError(t, err)
+
+	options := outbound.Options.(*option.VMessOutboundOptions)
+	require.NotNil(t, options.Transport)
+	require.Equal(t, C.V2RayTransportTypeGRPC, options.Transport.Type)
 }
 
 func TestParseVMessLinkHostServerNameFallback(t *testing.T) {
@@ -140,4 +171,51 @@ func TestParseHysteria2LinkOptions(t *testing.T) {
 	options := outbound.Options.(*option.Hysteria2OutboundOptions)
 	require.Equal(t, []string{"40000:50000"}, []string(options.ServerPorts))
 	require.Equal(t, "example.com", options.TLS.ServerName)
+}
+
+func TestParseHysteria2LinkALPN(t *testing.T) {
+	outbound, err := ParseSubscriptionLink("hysteria2://password@192.0.2.1:443?alpn=h3,h2")
+	require.NoError(t, err)
+
+	options := outbound.Options.(*option.Hysteria2OutboundOptions)
+	require.Equal(t, []string{"h3", "h2"}, []string(options.TLS.ALPN))
+}
+
+func TestParseVLESSLinkWebsocketEarlyDataHeaderName(t *testing.T) {
+	outbound, err := ParseSubscriptionLink("vless://11111111-1111-1111-1111-111111111111@192.0.2.1:443?type=ws&path=/?ed=2560&eh=X-Custom-Header")
+	require.NoError(t, err)
+
+	options := outbound.Options.(*option.VLESSOutboundOptions)
+	require.Equal(t, "X-Custom-Header", options.Transport.WebsocketOptions.EarlyDataHeaderName)
+}
+
+func TestParseShadowsocksLinkUDPOverTCP(t *testing.T) {
+	outbound, err := ParseSubscriptionLink("ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@192.0.2.1:8388?uot=1")
+	require.NoError(t, err)
+
+	options := outbound.Options.(*option.ShadowsocksOutboundOptions)
+	require.NotNil(t, options.UDPOverTCP)
+	require.True(t, options.UDPOverTCP.Enabled)
+}
+
+func TestParseHysteriaLinkMbpsAlias(t *testing.T) {
+	outbound, err := ParseSubscriptionLink("hysteria://192.0.2.1:443?auth=password&upmbps=100&downmbps=200")
+	require.NoError(t, err)
+
+	options := outbound.Options.(*option.HysteriaOutboundOptions)
+	require.Equal(t, 100, options.UpMbps)
+	require.Equal(t, 200, options.DownMbps)
+}
+
+func TestParseShadowsocksLinkLegacyFullBase64(t *testing.T) {
+	link := "ss://" + base64.RawURLEncoding.EncodeToString([]byte("chacha20-ietf-poly1305:oZIoA69Q8yhcQV8ka3Pa3A@192.0.2.1:8080")) + "#TEST"
+	outbound, err := ParseSubscriptionLink(link)
+	require.NoError(t, err)
+
+	require.Equal(t, "TEST", outbound.Tag)
+	options := outbound.Options.(*option.ShadowsocksOutboundOptions)
+	require.Equal(t, "chacha20-ietf-poly1305", options.Method)
+	require.Equal(t, "oZIoA69Q8yhcQV8ka3Pa3A", options.Password)
+	require.Equal(t, "192.0.2.1", options.Server)
+	require.Equal(t, uint16(8080), options.ServerPort)
 }
