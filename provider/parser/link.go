@@ -40,14 +40,10 @@ func ParseSubscriptionLink(link string) (option.Outbound, error) {
 		return parseHysteria2Link(link)
 	case "anytls":
 		return parseAnyTLSLink(link)
-	}
-	result[3], _ = DecodeBase64URLSafe(result[3])
-	link = strings.Join(result[1:], "")
-	switch scheme {
-	case "ss":
-		return parseShadowsocksLink(link)
 	case "vmess":
 		return parseVMessLink(link)
+	case "ss":
+		return parseShadowsocksLink(link)
 	default:
 		return option.Outbound{}, E.New("unsupported scheme: ", scheme)
 	}
@@ -121,13 +117,16 @@ func v2rayTransportWsPath(WebsocketOptions *option.V2RayWebsocketOptions, path s
 	}
 }
 
-func v2rayTransportWs(host string, path string) option.V2RayWebsocketOptions {
+func v2rayTransportWs(host string, path string, earlyDataHeaderName string) option.V2RayWebsocketOptions {
 	var WebsocketOptions option.V2RayWebsocketOptions
 	if host != "" {
 		WebsocketOptions.Headers = StringToType[badoption.HTTPHeader](F.ToString("Host: ", host))
 	}
 	if path != "" {
 		v2rayTransportWsPath(&WebsocketOptions, path)
+	}
+	if earlyDataHeaderName != "" {
+		WebsocketOptions.EarlyDataHeaderName = earlyDataHeaderName
 	}
 	return WebsocketOptions
 }
@@ -151,25 +150,44 @@ func parseShadowsocksLink(link string) (option.Outbound, error) {
 	if err != nil {
 		return option.Outbound{}, err
 	}
+	tag := linkURL.Fragment
+	if linkURL.Port() == "" {
+		decoded, _ := DecodeBase64URLSafe(linkURL.Host)
+		if decodedURL, err := url.Parse("ss://" + decoded); err == nil && decodedURL.User != nil {
+			linkURL = decodedURL
+		}
+	}
 	if linkURL.User == nil || linkURL.User.Username() == "" {
 		return option.Outbound{}, E.New("missing user info")
 	}
 	var options option.ShadowsocksOutboundOptions
 	options.ServerOptions.Server = linkURL.Hostname()
 	options.ServerOptions.ServerPort = StringToType[uint16](linkURL.Port())
-	password, _ := linkURL.User.Password()
-	if password == "" {
-		return option.Outbound{}, E.New("bad user info")
+	if password, ok := linkURL.User.Password(); ok {
+		options.Method = linkURL.User.Username()
+		options.Password = password
+	} else {
+		decoded, _ := DecodeBase64URLSafe(linkURL.User.Username())
+		method, password, hasSeparator := strings.Cut(decoded, ":")
+		if !hasSeparator {
+			return option.Outbound{}, E.New("bad user info")
+		}
+		options.Method = method
+		options.Password = password
 	}
-	options.Method = linkURL.User.Username()
-	options.Password = password
-	plugin := linkURL.Query().Get("plugin")
+	query := linkURL.Query()
+	plugin := query.Get("plugin")
 	options.Plugin = shadowsocksPluginName(plugin)
 	options.PluginOptions = shadowsocksPluginOptions(plugin)
+	if value := query.Get("udp-over-tcp"); value == "1" || value == "true" {
+		options.UDPOverTCP = &option.UDPOverTCPOptions{Enabled: true}
+	} else if value = query.Get("uot"); value == "1" || value == "true" {
+		options.UDPOverTCP = &option.UDPOverTCPOptions{Enabled: true}
+	}
 
 	outbound := option.Outbound{
 		Type: C.TypeShadowsocks,
-		Tag:  linkURL.Fragment,
+		Tag:  tag,
 	}
 	outbound.Options = &options
 	return outbound, nil
@@ -246,9 +264,10 @@ func parseTuicLink(link string) (option.Outbound, error) {
 
 func parseVMessLink(link string) (option.Outbound, error) {
 	var proxy map[string]string
+	decoded, _ := DecodeBase64URLSafe(link[len("vmess://"):])
 	reg := regexp.MustCompile(`(\"[^:,]+?\"[ \t]*:[ \t]*)(\d+|true|false)`)
-	s := reg.ReplaceAllString(link, `$1"$2"`)
-	err := json.Unmarshal([]byte(s[8:]), &proxy)
+	s := reg.ReplaceAllString(decoded, `$1"$2"`)
+	err := json.Unmarshal([]byte(s), &proxy)
 	if err != nil {
 		proxy = make(map[string]string)
 		linkURL, err := url.Parse(link)
@@ -266,9 +285,12 @@ func parseVMessLink(link string) (option.Outbound, error) {
 			value := values[0]
 			switch key {
 			case "type":
-				if value == "http" {
+				switch value {
+				case "http":
 					proxy["net"] = "tcp"
 					proxy["type"] = "http"
+				case "ws", "grpc":
+					proxy["net"] = value
 				}
 			case "encryption":
 				proxy["scy"] = value
@@ -341,7 +363,7 @@ func parseVMessLink(link string) (option.Outbound, error) {
 			switch value {
 			case "ws":
 				Transport.Type = C.V2RayTransportTypeWebsocket
-				Transport.WebsocketOptions = v2rayTransportWs(proxy["host"], proxy["path"])
+				Transport.WebsocketOptions = v2rayTransportWs(proxy["host"], proxy["path"], proxy["eh"])
 			case "h2":
 				Transport.Type = C.V2RayTransportTypeHTTP
 				TLSOptions.Enabled = true
@@ -447,7 +469,7 @@ func parseVLESSLink(link string) (option.Outbound, error) {
 			switch value {
 			case "ws":
 				Transport.Type = C.V2RayTransportTypeWebsocket
-				Transport.WebsocketOptions = v2rayTransportWs(proxy["host"], proxy["path"])
+				Transport.WebsocketOptions = v2rayTransportWs(proxy["host"], proxy["path"], proxy["eh"])
 			case "http":
 				Transport.Type = C.V2RayTransportTypeHTTP
 				if host, exists := proxy["host"]; exists && host != "" {
@@ -572,7 +594,7 @@ func parseTrojanLink(link string) (option.Outbound, error) {
 			switch value {
 			case "ws":
 				Transport.Type = C.V2RayTransportTypeWebsocket
-				Transport.WebsocketOptions = v2rayTransportWs(proxy["host"], proxy["path"])
+				Transport.WebsocketOptions = v2rayTransportWs(proxy["host"], proxy["path"], proxy["eh"])
 			case "grpc":
 				Transport.Type = C.V2RayTransportTypeGRPC
 				if serviceName, exists := proxy["grpc-service-name"]; exists && serviceName != "" {
@@ -628,12 +650,12 @@ func parseHysteriaLink(link string) (option.Outbound, error) {
 		case "up":
 			options.Up = &byteformats.NetworkBytesCompat{}
 			options.Up.UnmarshalJSON([]byte(value))
-		case "up_mbps":
+		case "up_mbps", "upmbps":
 			options.UpMbps, _ = strconv.Atoi(value)
 		case "down":
 			options.Down = &byteformats.NetworkBytesCompat{}
 			options.Down.UnmarshalJSON([]byte(value))
-		case "down_mbps":
+		case "down_mbps", "downmbps":
 			options.DownMbps, _ = strconv.Atoi(value)
 		case "obfs", "obfsParam":
 			options.Obfs = value
@@ -709,6 +731,8 @@ func parseHysteria2Link(link string) (option.Outbound, error) {
 			if value == "1" || value == "true" {
 				TLSOptions.Insecure = true
 			}
+		case "alpn":
+			TLSOptions.ALPN = strings.Split(value, ",")
 		}
 	}
 	outbound := option.Outbound{
