@@ -88,9 +88,9 @@ func NewProviderLocal(ctx context.Context, router adapter.Router, logFactory log
 	watcher, err := fswatch.NewWatcher(fswatch.Options{
 		Path: []string{filePath},
 		Callback: func(path string) {
-			uErr := provider.reloadFile(path)
-			if uErr != nil {
+			if uErr := provider.reloadFile(path); uErr != nil {
 				logger.Error(E.Cause(uErr, "reload provider ", tag))
+				return
 			}
 			provider.UpdateGroups()
 		},
@@ -146,14 +146,16 @@ func (s *ProviderLocal) reloadFile(path string) error {
 		return closeErr
 	}
 	s.lastUpdated = fileInfo.ModTime()
-	outboundOpts, endpointOpts, err := parser.ParseSubscription(s.ctx, string(content), s.overrideDialer, s.Tag())
+	outboundOpts, endpointOpts, err := parser.ParseSubscription(s.ctx, string(content))
 	if err != nil {
 		return err
 	}
+	outboundOpts, endpointOpts = parser.ApplyOverrideDialer(outboundOpts, endpointOpts, s.overrideDialer, s.Tag())
 	s.UpdateOutbounds(s.lastOutOpts, outboundOpts)
 	s.lastOutOpts = outboundOpts
 	s.UpdateEndpoints(s.lastEPOpts, endpointOpts)
 	s.lastEPOpts = endpointOpts
+	s.TriggerHealthCheck()
 	return nil
 }
 
