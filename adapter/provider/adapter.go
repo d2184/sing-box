@@ -180,8 +180,11 @@ func (a *Adapter) UpdateOutbounds(oldOpts []option.Outbound, newOpts []option.Ou
 	a.outbounds = outbounds
 	a.outboundsByTag = outboundsByTag
 	a.outboundsAccess.Unlock()
+}
+
+func (a *Adapter) TriggerHealthCheck() {
 	if a.enabled && a.history != nil {
-		go a.HealthCheck(a.ctx)
+		go a.healthcheck(a.ctx)
 	}
 }
 
@@ -212,7 +215,9 @@ func (a *Adapter) UpdateGroups() {
 	}
 	a.callbackAccess.Unlock()
 	for _, callback := range callbacks {
-		callback(a.providerTag)
+		if err := callback(a.providerTag); err != nil {
+			a.logger.Error("update group: ", err)
+		}
 	}
 }
 
@@ -416,9 +421,6 @@ func (a *Adapter) UpdateEndpoints(oldOpts []option.Endpoint, newOpts []option.En
 	a.endpoints = endpoints
 	a.endpointsByTag = endpointsByTag
 	a.outboundsAccess.Unlock()
-	if a.enabled && a.history != nil {
-		go a.HealthCheck(a.ctx)
-	}
 }
 
 func (a *Adapter) removeUselessEndpoints(newTags []string) {
