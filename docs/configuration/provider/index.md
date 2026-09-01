@@ -126,17 +126,17 @@ URL to the provider.
 
 #### path
 
-Path used to store the downloaded provider.
+Path used to persist the parsed provider content. The file is plain text (sing-box configuration JSON), not a database file, and not the raw provider content.
 
-The cache metadata is stored in `cache.db`.
+This field works independently of `cache.db`. If provider caching in `cache.db` is also enabled, its hash is additionally stored there (without the content itself) to detect tampering.
 
 Conflicts with `initial_path`.
 
 #### initial_path
 
-Path to the initial provider content.
+Path to the initial provider content. Its format must match the raw provider content (sing-box, Clash, SIP008, or raw node links are supported), which differs from the cache format used by `path`.
 
-It is loaded only when provider caching in `cache.db` is enabled and no cached provider is available. It is not used as the persistent cache path.
+It is loaded once, only when provider caching in `cache.db` is enabled and no cached provider is available, to seed the initial startup. It is not written back to this path or to `cache.db` until the next provider update.
 
 Conflicts with `path`.
 
