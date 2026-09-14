@@ -387,29 +387,18 @@ func (s *ProviderRemote) loadCacheFile() (bool, error) {
 		}
 	}
 	if s.path != "" {
-		exists, err := pathExists(s.ctx, s.path)
-		if err != nil {
-			return false, err
-		}
-		if !exists {
+		info, err := filemanager.Stat(s.ctx, s.path)
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
 			return false, nil
+		case err != nil:
+			return false, err
+		case info.IsDir():
+			return false, E.New("provider path is a directory: ", s.path)
 		}
-		file, err := filemanager.Open(s.ctx, s.path)
+		content, err = filemanager.ReadFile(s.ctx, s.path)
 		if err != nil {
 			return false, err
-		}
-		content, err = io.ReadAll(file)
-		if err != nil {
-			file.Close()
-			return false, err
-		}
-		fileInfo, err := file.Stat()
-		closeErr := file.Close()
-		if err != nil {
-			return false, err
-		}
-		if closeErr != nil {
-			return false, closeErr
 		}
 		if saveSub != nil {
 			if !s.hash.Equal(hash.MakeHash(content)) {
@@ -418,7 +407,7 @@ func (s *ProviderRemote) loadCacheFile() (bool, error) {
 			lastUpdated = saveSub.LastUpdated
 			lastEtag = saveSub.LastEtag
 		} else {
-			lastUpdated = fileInfo.ModTime()
+			lastUpdated = info.ModTime()
 		}
 	} else if saveSub != nil && len(saveSub.Content) > 0 {
 		content = saveSub.Content
@@ -427,9 +416,15 @@ func (s *ProviderRemote) loadCacheFile() (bool, error) {
 	} else {
 		return false, nil
 	}
-	if err := s.loadFromContent(content); err != nil {
+	jsonContent, _ := s.stripInfoLine(string(content))
+	outboundOpts, endpointOpts, err := parser.ParseBoxSubscription(s.ctx, jsonContent)
+	if err != nil {
 		return false, err
 	}
+	s.UpdateOutbounds(s.lastOutOpts, outboundOpts)
+	s.lastOutOpts = outboundOpts
+	s.UpdateEndpoints(s.lastEPOpts, endpointOpts)
+	s.lastEPOpts = endpointOpts
 	s.UpdateGroups()
 	s.lastUpdated, s.lastEtag = lastUpdated, lastEtag
 	return true, nil
@@ -440,52 +435,17 @@ func (s *ProviderRemote) loadInitialPath() error {
 	if err != nil {
 		return err
 	}
-	content := s.decodeContent(contentRaw)
+	content, _ := parser.DecodeBase64URLSafe(string(contentRaw))
+	content, hasInfo := s.stripInfoLine(content)
+	if hasInfo {
+		content, _ = parser.DecodeBase64URLSafe(content)
+	}
 	err = s.updateProviderFromContent(content)
 	if err != nil {
 		return err
 	}
 	s.UpdateGroups()
 	return nil
-}
-
-func (s *ProviderRemote) loadFromContent(contentRaw []byte) error {
-	content := s.decodeContent(contentRaw)
-	outboundOpts, endpointOpts, err := parser.ParseBoxSubscription(s.ctx, content)
-	if err != nil {
-		return err
-	}
-	s.UpdateOutbounds(s.lastOutOpts, outboundOpts)
-	s.lastOutOpts = outboundOpts
-	s.UpdateEndpoints(s.lastEPOpts, endpointOpts)
-	s.lastEPOpts = endpointOpts
-	return nil
-}
-
-func (s *ProviderRemote) decodeContent(contentRaw []byte) string {
-	content, _ := parser.DecodeBase64URLSafe(string(contentRaw))
-	firstLine, others := getFirstLine(content)
-	if info, ok := parseInfo(firstLine); ok {
-		s.infoMu.Lock()
-		s.subscriptionInfo = info
-		s.infoMu.Unlock()
-		content, _ = parser.DecodeBase64URLSafe(others)
-	}
-	return content
-}
-
-func pathExists(ctx context.Context, path string) (bool, error) {
-	info, err := filemanager.Stat(ctx, path)
-	if err == nil {
-		if info.IsDir() {
-			return false, E.New("provider path is a directory: ", path)
-		}
-		return true, nil
-	}
-	if errors.Is(err, fs.ErrNotExist) {
-		return false, nil
-	}
-	return false, err
 }
 
 func (s *ProviderRemote) loopUpdate() {
@@ -538,6 +498,18 @@ func (s *ProviderRemote) saveCacheFile(hasInfo bool, info adapter.SubscriptionIn
 	}
 	s.hash = hash.MakeHash(content)
 	return nil
+}
+
+func (s *ProviderRemote) stripInfoLine(content string) (string, bool) {
+	firstLine, others := getFirstLine(content)
+	info, ok := parseInfo(firstLine)
+	if !ok {
+		return content, false
+	}
+	s.infoMu.Lock()
+	s.subscriptionInfo = info
+	s.infoMu.Unlock()
+	return others, true
 }
 
 func (s *ProviderRemote) updateProviderFromContent(content string) error {
