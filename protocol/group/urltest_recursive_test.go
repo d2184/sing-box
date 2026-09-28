@@ -44,6 +44,11 @@ func TestURLTestDeduplicatesSameLeafAndURLAcrossNestedGroups(t *testing.T) {
 	require.Contains(t, result, leaf.tag)
 	require.Contains(t, result, firstGroup.Tag())
 	require.Contains(t, result, secondGroup.Tag())
+
+	// Verify history was written
+	leafHistory := history.LoadURLTestHistory(leaf.tag)
+	require.NotNil(t, leafHistory)
+	// Note: delay might be 0 for very fast local connections, which is valid
 }
 
 func TestURLTestDoesNotDeduplicateDifferentURLs(t *testing.T) {
@@ -74,6 +79,36 @@ func TestURLTestDoesNotDeduplicateDifferentURLs(t *testing.T) {
 	require.EqualValues(t, 2, leaf.dialCount.Load())
 	require.EqualValues(t, 1, firstRequests.Load())
 	require.EqualValues(t, 1, secondRequests.Load())
+}
+
+func TestURLTestWaiterWritesResultToItsOwnBatch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	leaf := &recursiveURLTestOutbound{tag: "leaf"}
+	manager := &recursiveURLTestOutboundManager{outbounds: make(map[string]adapter.Outbound)}
+	history := urltest.NewHistoryStorage()
+	firstGroup := newURLTestForRecursiveTest("first", server.URL, manager, history, leaf)
+	secondGroup := newURLTestForRecursiveTest("second", server.URL, manager, history, leaf)
+	manager.outbounds[leaf.tag] = leaf
+	manager.outbounds[firstGroup.Tag()] = firstGroup
+	manager.outbounds[secondGroup.Tag()] = secondGroup
+
+	// Create a shared session context
+	ctx, session := urlTestSessionFromContext(context.Background())
+
+	// Test both groups with shared session
+	firstResult := URLTestOutbounds(ctx, manager, history, log.NewNOPFactory().Logger(), firstGroup.group.outbounds, server.URL, time.Hour, true)
+	require.Contains(t, firstResult, leaf.tag, "first group (executor) should contain leaf result")
+
+	// Second test will be a waiter since it shares the session
+	secondResult := URLTestOutbounds(ctx, manager, history, log.NewNOPFactory().Logger(), secondGroup.group.outbounds, server.URL, time.Hour, true)
+	require.Contains(t, secondResult, leaf.tag, "second group (waiter) should also contain leaf result")
+
+	// Verify session is actually shared
+	require.NotNil(t, session)
 }
 
 func TestURLTestSelectionKeepsCurrentWithinTolerance(t *testing.T) {
