@@ -545,7 +545,7 @@ func urlTestSessionFromContext(ctx context.Context) (context.Context, *urlTestSe
 	return context.WithValue(ctx, urlTestSessionContextKey{}, session), session
 }
 
-func (s *urlTestSession) test(ctx context.Context, key urlTestSessionKey, test func() urlTestResult) (result urlTestResult) {
+func (s *urlTestSession) test(ctx context.Context, key urlTestSessionKey, test func() urlTestResult) (result urlTestResult, executed bool) {
 	s.access.Lock()
 	call, loaded := s.calls[key]
 	if !loaded {
@@ -556,16 +556,16 @@ func (s *urlTestSession) test(ctx context.Context, key urlTestSessionKey, test f
 	if loaded {
 		select {
 		case <-call.done:
-			return call.result
+			return call.result, false
 		case <-ctx.Done():
-			return urlTestResult{err: ctx.Err()}
+			return urlTestResult{err: ctx.Err()}, false
 		}
 	}
 	defer func() {
 		call.result = result
 		close(call.done)
 	}()
-	return test()
+	return test(), true
 }
 
 type urlTestBatch struct {
@@ -636,7 +636,7 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 			}
 			b.checked[tag] = true
 			b.batch.Go(tag, func() (any, error) {
-				testResult := b.session.test(b.ctx, urlTestSessionKey{tag: tag, link: link}, func() urlTestResult {
+				testResult, executed := b.session.test(b.ctx, urlTestSessionKey{tag: tag, link: link}, func() urlTestResult {
 					testCtx, cancel := context.WithTimeout(b.ctx, C.TCPTimeout)
 					defer cancel()
 					testChan := make(chan urlTestResult, 1)
@@ -655,14 +655,18 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 					if b.ctx.Err() != nil {
 						return nil, nil
 					}
-					b.logger.Debug("outbound ", tag, " unavailable: ", testResult.err)
-					b.history.DeleteURLTestHistory(tag)
+					if executed {
+						b.logger.Debug("outbound ", tag, " unavailable: ", testResult.err)
+						b.history.DeleteURLTestHistory(tag)
+					}
 				} else {
-					b.logger.Debug("outbound ", tag, " available: ", testResult.delay, "ms")
-					b.history.StoreURLTestHistory(tag, &adapter.URLTestHistory{
-						Time:  time.Now(),
-						Delay: testResult.delay,
-					})
+					if executed {
+						b.logger.Debug("outbound ", tag, " available: ", testResult.delay, "ms")
+						b.history.StoreURLTestHistory(tag, &adapter.URLTestHistory{
+							Time:  time.Now(),
+							Delay: testResult.delay,
+						})
+					}
 					b.access.Lock()
 					b.result[tag] = testResult.delay
 					b.access.Unlock()
