@@ -34,6 +34,8 @@ import (
 	"github.com/sagernet/sing/service/filemanager"
 )
 
+var infoRegexp = regexp.MustCompile(`(upload|download|total|expire)[\s\t]*=[\s\t]*(-?\d*);?`)
+
 func RegisterProvider(registry *provider.Registry) {
 	provider.Register[option.ProviderRemoteOptions](registry, C.ProviderTypeRemote, NewProviderRemote)
 }
@@ -200,11 +202,14 @@ func (s *ProviderRemote) StartContext(ctx context.Context, startContext *adapter
 }
 
 func (s *ProviderRemote) Update() error {
+	ctx := interrupt.ContextWithIsProviderConnection(s.ctx)
+	if err := s.fetch(ctx, false); err != nil {
+		return err
+	}
 	if s.ticker != nil {
 		s.ticker.Reset(s.updateInterval)
 	}
-	ctx := interrupt.ContextWithIsProviderConnection(s.ctx)
-	return s.fetch(ctx, false)
+	return nil
 }
 
 func (s *ProviderRemote) UpdatedAt() time.Time {
@@ -294,7 +299,9 @@ func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
 	case http.StatusOK:
 	case http.StatusNotModified:
 		s.infoMu.Lock()
-		s.subscriptionInfo = info
+		if hasInfo {
+			s.subscriptionInfo = info
+		}
 		s.lastUpdated = time.Now()
 		s.infoMu.Unlock()
 		if s.cacheFile != nil {
@@ -324,6 +331,7 @@ func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
 	if err != nil {
 		return err
 	}
+	eTagHeader := resp.Header.Get("Etag")
 	content, _ := parser.DecodeBase64URLSafe(string(contentRaw))
 	if !hasInfo {
 		firstLine, others := getFirstLine(content)
@@ -335,9 +343,13 @@ func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
 	if err := s.updateProviderFromContent(content); err != nil {
 		return err
 	}
+	if eTagHeader != "" {
+		s.infoMu.Lock()
+		s.lastEtag = eTagHeader
+		s.infoMu.Unlock()
+	}
 	s.UpdateGroups()
 	s.infoMu.Lock()
-	s.lastEtag = resp.Header.Get("Etag")
 	s.subscriptionInfo = info
 	s.lastUpdated = time.Now()
 	s.infoMu.Unlock()
@@ -422,6 +434,8 @@ func (s *ProviderRemote) loadCacheFile() (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	outboundOpts, endpointOpts = s.filterOptions(outboundOpts, endpointOpts)
+	outboundOpts, endpointOpts = parser.ApplyOverrideDialer(outboundOpts, endpointOpts, s.overrideDialer, s.Tag())
 	s.UpdateNodes(outboundOpts, endpointOpts)
 	s.lastOutOpts = outboundOpts
 	s.lastEPOpts = endpointOpts
@@ -465,12 +479,12 @@ func (s *ProviderRemote) loopUpdate() {
 		s.ticker.Reset(s.updateInterval)
 	}
 	for {
-		runtime.GC()
 		select {
 		case <-s.ctx.Done():
 			return
 		case <-s.ticker.C:
 			s.updateOnce()
+			runtime.GC()
 			s.ticker.Reset(s.updateInterval)
 		}
 	}
@@ -513,33 +527,38 @@ func (s *ProviderRemote) stripInfoLine(content string) (string, bool) {
 }
 
 func (s *ProviderRemote) updateProviderFromContent(content string) error {
-	outboundOpts, endpointOpts, err := parser.ParseSubscription(s.ctx, content, s.overrideDialer, s.Tag())
+	outboundOpts, endpointOpts, err := parser.ParseSubscription(s.ctx, content)
 	if err != nil {
 		return err
 	}
-	outboundOpts = common.Filter(outboundOpts, func(it option.Outbound) bool {
-		return (s.exclude == nil || !s.exclude.MatchString(it.Tag)) && (s.include == nil || s.include.MatchString(it.Tag))
-	})
-	endpointOpts = common.Filter(endpointOpts, func(it option.Endpoint) bool {
-		return (s.exclude == nil || !s.exclude.MatchString(it.Tag)) && (s.include == nil || s.include.MatchString(it.Tag))
-	})
-	updateErr := s.UpdateNodes(outboundOpts, endpointOpts)
-	s.UpdateGroups()
-	if updateErr != nil {
-		return updateErr
-	}
-	s.lastOutOpts = outboundOpts
-	s.lastEPOpts = endpointOpts
+	outboundOpts, endpointOpts = s.filterOptions(outboundOpts, endpointOpts)
+	outboundOpts, endpointOpts = parser.ApplyOverrideDialer(outboundOpts, endpointOpts, s.overrideDialer, s.Tag())
+	s.applyOptions(outboundOpts, endpointOpts)
 	return nil
 }
 
-func getFirstLine(content string) (string, string) {
-	lines := strings.Split(content, "\n")
-	if len(lines) == 1 {
-		return lines[0], ""
+func (s *ProviderRemote) filterOptions(outboundOpts []option.Outbound, endpointOpts []option.Endpoint) ([]option.Outbound, []option.Endpoint) {
+	matchTag := func(tag string) bool {
+		return (s.exclude == nil || !s.exclude.MatchString(tag)) && (s.include == nil || s.include.MatchString(tag))
 	}
-	others := strings.Join(lines[1:], "\n")
-	return lines[0], others
+	outboundOpts = common.Filter(outboundOpts, func(it option.Outbound) bool { return matchTag(it.Tag) })
+	endpointOpts = common.Filter(endpointOpts, func(it option.Endpoint) bool { return matchTag(it.Tag) })
+	return outboundOpts, endpointOpts
+}
+
+func (s *ProviderRemote) applyOptions(outboundOpts []option.Outbound, endpointOpts []option.Endpoint) {
+	updateErr := s.UpdateNodes(outboundOpts, endpointOpts)
+	s.UpdateGroups()
+	if updateErr != nil {
+		s.logger.Error("update nodes: ", updateErr)
+	}
+	s.lastOutOpts = outboundOpts
+	s.lastEPOpts = endpointOpts
+}
+
+func getFirstLine(content string) (string, string) {
+	first, rest, _ := strings.Cut(content, "\n")
+	return first, rest
 }
 
 func parseInfo(infoStr string) (adapter.SubscriptionInfo, bool) {
@@ -547,8 +566,7 @@ func parseInfo(infoStr string) (adapter.SubscriptionInfo, bool) {
 	if infoStr == "" {
 		return info, false
 	}
-	reg := regexp.MustCompile(`(upload|download|total|expire)[\s\t]*=[\s\t]*(-?\d*);?`)
-	matches := reg.FindAllStringSubmatch(infoStr, 4)
+	matches := infoRegexp.FindAllStringSubmatch(infoStr, 4)
 	if len(matches) == 0 {
 		return info, false
 	}
