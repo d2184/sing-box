@@ -17,22 +17,23 @@ var subscriptionParsers = []func(ctx context.Context, content string) ([]option.
 	ParseRawSubscription,
 }
 
-func ParseSubscription(ctx context.Context, content string, overrideDialerOptions *option.OverrideDialerOptions, providerTag string) ([]option.Outbound, []option.Endpoint, error) {
+func ParseSubscription(ctx context.Context, content string) ([]option.Outbound, []option.Endpoint, error) {
 	var pErr error
 	for _, parser := range subscriptionParsers {
 		outbounds, endpoints, err := parser(ctx, content)
 		if len(outbounds) > 0 || len(endpoints) > 0 {
-			tags := providerTags(outbounds, endpoints)
-			return overrideOutbounds(outbounds, overrideDialerOptions, tags, providerTag),
-				overrideEndpoints(endpoints, overrideDialerOptions, tags, providerTag),
-				nil
+			return outbounds, endpoints, nil
 		}
 		pErr = E.Errors(pErr, err)
 	}
 	return nil, nil, E.Cause(pErr, "no servers found")
 }
 
-func providerTags(outbounds []option.Outbound, endpoints []option.Endpoint) []string {
+// ApplyOverrideDialer rewrites detours to provider-scoped tags and applies the
+// override dialer options. It modifies the node options in place and is not
+// idempotent: apply it exactly once to freshly parsed nodes, never to nodes it
+// has already processed or to nodes restored from a cache of its output.
+func ApplyOverrideDialer(outbounds []option.Outbound, endpoints []option.Endpoint, overrideDialerOptions *option.OverrideDialerOptions, providerTag string) ([]option.Outbound, []option.Endpoint) {
 	tags := make([]string, 0, len(outbounds)+len(endpoints))
 	for _, outbound := range outbounds {
 		tags = append(tags, outbound.Tag)
@@ -40,7 +41,8 @@ func providerTags(outbounds []option.Outbound, endpoints []option.Endpoint) []st
 	for _, endpoint := range endpoints {
 		tags = append(tags, endpoint.Tag)
 	}
-	return tags
+	return overrideOutbounds(outbounds, overrideDialerOptions, tags, providerTag),
+		overrideEndpoints(endpoints, overrideDialerOptions, tags, providerTag)
 }
 
 func overrideOutbounds(outbounds []option.Outbound, overrideDialerOptions *option.OverrideDialerOptions, tags []string, providerTag string) []option.Outbound {
