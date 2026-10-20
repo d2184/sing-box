@@ -65,7 +65,6 @@ type ProviderRemote struct {
 	url               string
 	urlHash           [32]byte
 	path              string
-	initialPath       string
 	userAgent         string
 	updateInterval    time.Duration
 	exclude           *regexp.Regexp
@@ -78,37 +77,16 @@ func NewProviderRemote(ctx context.Context, router adapter.Router, logFactory lo
 	if options.URL == "" {
 		return nil, E.New("provider URL is required")
 	}
-	if options.Path != "" && options.InitialPath != "" {
-		return nil, E.New("provider path and initial_path are mutually exclusive")
-	}
-	var (
-		path        string
-		initialPath string
-	)
+	var path string
 	if options.Path != "" {
 		path = filemanager.BasePath(ctx, options.Path)
 		path, _ = filepath.Abs(path)
-	}
-	if options.InitialPath != "" {
-		initialPath = filemanager.BasePath(ctx, options.InitialPath)
-		initialPath, _ = filepath.Abs(initialPath)
-	}
-	if path != "" {
 		info, err := filemanager.Stat(ctx, path)
 		if err == nil && info.IsDir() {
 			return nil, E.New("provider path is a directory: ", path)
 		}
 		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return nil, E.Cause(err, "check provider path")
-		}
-	}
-	if initialPath != "" {
-		info, err := filemanager.Stat(ctx, initialPath)
-		if err == nil && info.IsDir() {
-			return nil, E.New("provider initial_path is a directory: ", initialPath)
-		}
-		if err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return nil, E.Cause(err, "check provider initial_path")
 		}
 	}
 	updateInterval := time.Duration(options.UpdateInterval)
@@ -144,7 +122,6 @@ func NewProviderRemote(ctx context.Context, router adapter.Router, logFactory lo
 		url:               url,
 		urlHash:           sha256.Sum256([]byte(url)),
 		path:              path,
-		initialPath:       initialPath,
 		userAgent:         userAgent,
 		updateInterval:    updateInterval,
 		exclude:           (*regexp.Regexp)(options.Exclude),
@@ -159,21 +136,9 @@ func NewProviderRemote(ctx context.Context, router adapter.Router, logFactory lo
 
 func (s *ProviderRemote) StartContext(ctx context.Context, startContext *adapter.HTTPStartContext) error {
 	s.cacheFile = service.FromContext[adapter.CacheFile](s.ctx)
-	if s.initialPath != "" && s.cacheFile == nil {
-		return E.New("provider initial_path requires cache_file")
-	}
 	loadedFromCache, err := s.loadCacheFile()
 	if err != nil {
 		s.logger.Warn(E.Cause(err, "restore cached outbound provider, will refetch"))
-	}
-	var loadedFromInitialPath bool
-	if !loadedFromCache && s.initialPath != "" {
-		err = s.loadInitialPath()
-		if err != nil {
-			s.logger.Warn(E.Cause(err, "load initial outbound provider from ", s.initialPath))
-		} else {
-			loadedFromInitialPath = true
-		}
 	}
 	transport, err := s.resolveTransport()
 	if err != nil {
@@ -181,7 +146,7 @@ func (s *ProviderRemote) StartContext(ctx context.Context, startContext *adapter
 	}
 	startContext.Register(transport)
 	s.httpClient = &http.Client{Transport: transport}
-	if !loadedFromCache && !loadedFromInitialPath {
+	if !loadedFromCache {
 		ctx = interrupt.ContextWithIsProviderConnection(ctx)
 		err = s.fetch(ctx, true)
 		if err != nil {
@@ -395,29 +360,18 @@ func (s *ProviderRemote) loadCacheFile() (bool, error) {
 		}
 	}
 	if s.path != "" {
-		exists, err := pathExists(s.ctx, s.path)
-		if err != nil {
-			return false, err
-		}
-		if !exists {
+		info, err := filemanager.Stat(s.ctx, s.path)
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
 			return false, nil
+		case err != nil:
+			return false, err
+		case info.IsDir():
+			return false, E.New("provider path is a directory: ", s.path)
 		}
-		file, err := filemanager.Open(s.ctx, s.path)
+		content, err = filemanager.ReadFile(s.ctx, s.path)
 		if err != nil {
 			return false, err
-		}
-		content, err = io.ReadAll(file)
-		if err != nil {
-			file.Close()
-			return false, err
-		}
-		fileInfo, err := file.Stat()
-		closeErr := file.Close()
-		if err != nil {
-			return false, err
-		}
-		if closeErr != nil {
-			return false, closeErr
 		}
 		if saveSub != nil {
 			if !s.hash.Equal(hash.MakeHash(content)) {
@@ -426,7 +380,7 @@ func (s *ProviderRemote) loadCacheFile() (bool, error) {
 			lastUpdated = saveSub.LastUpdated
 			lastEtag = saveSub.LastEtag
 		} else {
-			lastUpdated = fileInfo.ModTime()
+			lastUpdated = info.ModTime()
 		}
 	} else if saveSub != nil && len(saveSub.Content) > 0 {
 		content = saveSub.Content
@@ -449,21 +403,6 @@ func (s *ProviderRemote) loadCacheFile() (bool, error) {
 		s.lastEtag = ""
 	}
 	return true, nil
-}
-
-func (s *ProviderRemote) loadInitialPath() error {
-	contentRaw, err := filemanager.ReadFile(s.ctx, s.initialPath)
-	if err != nil {
-		return err
-	}
-	content, _ := s.decodeContent(contentRaw)
-	err = s.updateProviderFromContent(content)
-	if err != nil {
-		return err
-	}
-	s.lastRawContent = content
-	s.UpdateGroups()
-	return nil
 }
 
 func (s *ProviderRemote) loadFromContent(contentRaw []byte) (bool, error) {
@@ -494,20 +433,6 @@ func (s *ProviderRemote) decodeContent(contentRaw []byte) (string, bool) {
 		content, _ = parser.DecodeBase64URLSafe(others)
 	}
 	return content, isRaw
-}
-
-func pathExists(ctx context.Context, path string) (bool, error) {
-	info, err := filemanager.Stat(ctx, path)
-	if err == nil {
-		if info.IsDir() {
-			return false, E.New("provider path is a directory: ", path)
-		}
-		return true, nil
-	}
-	if errors.Is(err, fs.ErrNotExist) {
-		return false, nil
-	}
-	return false, err
 }
 
 func (s *ProviderRemote) loopUpdate() {
