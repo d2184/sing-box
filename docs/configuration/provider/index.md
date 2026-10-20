@@ -128,17 +128,9 @@ URL to the provider.
 
 Path used to store the downloaded provider.
 
-The cache metadata is stored in `cache.db`.
+If empty, the downloaded content is cached in `cache.db`.
 
-Conflicts with `initial_path`.
-
-#### initial_path
-
-Path to the initial provider content.
-
-It is loaded only when provider caching in `cache.db` is enabled and no cached provider is available. It is not used as the persistent cache path.
-
-Conflicts with `path`.
+If set, the downloaded content is parsed and stored in this file as sing-box JSON, and only the cache metadata is stored in `cache.db`.
 
 #### exclude
 
