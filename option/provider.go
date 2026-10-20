@@ -69,7 +69,6 @@ type ProviderLocalOptions struct {
 type ProviderRemoteOptions struct {
 	URL            string             `json:"url"`
 	Path           string             `json:"path,omitempty"`
-	InitialPath    string             `json:"initial_path,omitempty"`
 	UserAgent      string             `json:"user_agent,omitempty"`
 	HTTPClient     *HTTPClientOptions `json:"http_client,omitempty"`
 	UpdateInterval badoption.Duration `json:"update_interval,omitempty"`
@@ -86,50 +85,13 @@ type ProviderRemoteOptions struct {
 
 type providerRemoteOptionsSchema ProviderRemoteOptions
 
-func (o *ProviderRemoteOptions) UnmarshalJSON(content []byte) error {
-	err := json.Unmarshal(content, (*providerRemoteOptionsSchema)(o))
-	if err != nil {
-		return err
-	}
-	if o.Path != "" && o.InitialPath != "" {
-		return E.New("provider path and initial_path are mutually exclusive")
-	}
-	return nil
-}
-
 func (o ProviderRemoteOptions) DescribeSchema(builder schema.Builder) (*schema.Node, error) {
-	buildVariant := func(pathField string) (*schema.Node, error) {
-		variant := schema.StrictObject()
-		err := builder.FlattenStruct(variant, reflect.TypeFor[providerRemoteOptionsSchema]())
-		if err != nil {
-			return nil, err
-		}
-		switch pathField {
-		case "path":
-			variant.Properties.Remove("initial_path")
-			variant.Required = append(variant.Required, "path")
-		case "initial_path":
-			variant.Properties.Remove("path")
-			variant.Required = append(variant.Required, "initial_path")
-		default:
-			variant.Properties.Remove("path")
-			variant.Properties.Remove("initial_path")
-		}
-		return variant, nil
-	}
-	noPathVariant, err := buildVariant("")
+	node := schema.StrictObject()
+	err := builder.FlattenStruct(node, reflect.TypeFor[providerRemoteOptionsSchema]())
 	if err != nil {
 		return nil, err
 	}
-	pathVariant, err := buildVariant("path")
-	if err != nil {
-		return nil, err
-	}
-	initialPathVariant, err := buildVariant("initial_path")
-	if err != nil {
-		return nil, err
-	}
-	return schema.OneOf(noPathVariant, pathVariant, initialPathVariant), nil
+	return node, nil
 }
 
 type ProviderInlineOptions struct {
