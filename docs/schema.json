@@ -15303,9 +15303,6 @@
             "path": {
               "type": "string"
             },
-            "user_agent": {
-              "type": "string"
-            },
             "http_client": {
               "$ref": "#/$defs/HTTPClientReference"
             },

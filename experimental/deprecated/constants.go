@@ -158,6 +158,14 @@ var OptionLegacyProviderDownloadDetour = Note{
 	EnvName:           "LEGACY_PROVIDER_DOWNLOAD_DETOUR",
 }
 
+var OptionLegacyProviderUserAgent = Note{
+	Name:              "legacy-provider-user-agent",
+	Description:       "legacy `user_agent` remote provider option",
+	DeprecatedVersion: "1.14.0",
+	ScheduledVersion:  "1.16.0",
+	EnvName:           "LEGACY_PROVIDER_USER_AGENT",
+}
+
 var OptionImplicitDefaultHTTPClient = Note{
 	Name:              "implicit-default-http-client",
 	Description:       "implicit default HTTP client using default outbound for remote rule-sets",
@@ -187,6 +195,7 @@ var Options = []Note{
 	OptionIndependentDNSCache,
 	OptionStoreRDRC,
 	OptionLegacyProviderDownloadDetour,
+	OptionLegacyProviderUserAgent,
 	OptionImplicitDefaultHTTPClient,
 	OptionTunStack,
 }
