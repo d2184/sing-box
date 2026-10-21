@@ -69,7 +69,6 @@ type ProviderLocalOptions struct {
 type ProviderRemoteOptions struct {
 	URL            string             `json:"url"`
 	Path           string             `json:"path,omitempty"`
-	UserAgent      string             `json:"user_agent,omitempty"`
 	HTTPClient     *HTTPClientOptions `json:"http_client,omitempty"`
 	UpdateInterval badoption.Duration `json:"update_interval,omitempty"`
 
@@ -81,6 +80,9 @@ type ProviderRemoteOptions struct {
 
 	// Deprecated: use http_client instead
 	DownloadDetour string `json:"download_detour,omitempty" reference:"outbound" schema:"omit"`
+
+	// Deprecated: use http_client.headers instead
+	UserAgent string `json:"user_agent,omitempty" schema:"omit"`
 }
 
 type providerRemoteOptionsSchema ProviderRemoteOptions

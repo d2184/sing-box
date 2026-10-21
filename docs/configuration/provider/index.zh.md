@@ -6,6 +6,8 @@
 
     :material-delete-clock: [download_detour](#download_detour)
 
+    :material-delete-clock: [user_agent](#user_agent)
+
 ### 结构
 
 订阅源列表。
@@ -49,14 +51,14 @@
           "path": "",
           "exclude": "",
           "include": "",
-          "user_agent": "",
           "http_client": "", // or {}
           "update_interval": "",
           "override_dialer": {},
 
           // Deprecated
 
-          "download_detour": ""
+          "download_detour": "",
+          "user_agent": ""
         }
       ]
     }
@@ -141,6 +143,10 @@
 包含节点的正则表达式。
 
 #### user_agent
+
+!!! failure "已在 sing-box 1.14.0 废弃"
+
+    `user_agent` 已在 sing-box 1.14.0 废弃且将在 sing-box 1.16.0 中被移除，请使用 `http_client.headers` 代替。
 
 用于下载订阅内容的 User-Agent。
 

@@ -98,14 +98,16 @@ func NewProviderRemote(ctx context.Context, router adapter.Router, logFactory lo
 	if updateInterval < time.Hour {
 		updateInterval = time.Hour
 	}
-	if options.UserAgent != "" && options.HTTPClient != nil && !options.HTTPClient.IsEmpty() {
+	//nolint:staticcheck
+	userAgent := options.UserAgent
+	if userAgent != "" {
+		deprecated.Report(ctx, deprecated.OptionLegacyProviderUserAgent)
+	}
+	if userAgent != "" && options.HTTPClient != nil && !options.HTTPClient.IsEmpty() {
 		return nil, E.New("user_agent conflicts with http_client: configure User-Agent via http_client.headers instead")
 	}
-	var userAgent string
-	if options.UserAgent == "" {
+	if userAgent == "" {
 		userAgent = "sing-box " + C.Version
-	} else {
-		userAgent = options.UserAgent
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	outbound := service.FromContext[adapter.OutboundManager](ctx)
