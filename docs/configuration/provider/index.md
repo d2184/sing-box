@@ -6,6 +6,8 @@
 
     :material-delete-clock: [download_detour](#download_detour)
 
+    :material-delete-clock: [user_agent](#user_agent)
+
 ### Structure
 
 List of subscription providers.
@@ -49,14 +51,14 @@ List of subscription providers.
           "path": "",
           "exclude": "",
           "include": "",
-          "user_agent": "",
           "http_client": "", // or {}
           "update_interval": "",
           "override_dialer": {},
 
           // Deprecated
 
-          "download_detour": ""
+          "download_detour": "",
+          "user_agent": ""
         }
       ]
     }
@@ -141,6 +143,10 @@ Exclude regular expression to filter nodes.
 Include regular expression to filter nodes.
 
 #### user_agent
+
+!!! failure "Deprecated in sing-box 1.14.0"
+
+    `user_agent` is deprecated in sing-box 1.14.0 and will be removed in sing-box 1.16.0, use `http_client.headers` instead.
 
 User agent used to download the provider.
 
