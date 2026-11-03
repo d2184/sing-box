@@ -550,13 +550,10 @@ func (g *URLTestGroup) urlTestWait(ctx context.Context, force bool) (map[string]
 }
 
 func (g *URLTestGroup) urlTestLocked(ctx context.Context, force bool) (map[string]uint16, error) {
-	result := urlTestOutbounds(ctx, g.outbound, g.history, g.logger, g.loadOutbounds(), g.link, g.interval, force)
-	select {
-	case <-ctx.Done():
-	default:
-		g.performUpdateCheck()
+	result := URLTestOutbounds(ctx, g.outbound, g.history, g.logger, g.loadOutbounds(), g.link, g.interval, force)
+	if ctx.Err() == nil && g.performUpdateCheck() {
+		g.history.NotifyUpdated()
 	}
-	g.history.NotifyUpdated()
 	return result, nil
 }
 
@@ -629,17 +626,9 @@ type urlTestBatch struct {
 	groups   []adapter.OutboundGroup
 	access   sync.Mutex
 	result   map[string]uint16
-	stored   map[string]*adapter.URLTestHistory
-	deleted  []string
 }
 
 func URLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, force bool) map[string]uint16 {
-	result := urlTestOutbounds(ctx, outboundManager, history, logger, outbounds, link, interval, force)
-	history.NotifyUpdated()
-	return result
-}
-
-func urlTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, force bool) map[string]uint16 {
 	ctx, session := urlTestSessionFromContext(ctx)
 	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](10))
 	testBatch := &urlTestBatch{
@@ -651,11 +640,9 @@ func urlTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManag
 		batch:    b,
 		checked:  make(map[string]bool),
 		result:   make(map[string]uint16),
-		stored:   make(map[string]*adapter.URLTestHistory),
 	}
 	testBatch.test(outbounds, link, interval, force)
 	b.Wait()
-	history.UpdateURLTestHistory(testBatch.stored, testBatch.deleted)
 	for _, outboundGroup := range testBatch.groups {
 		groupHistory := history.LoadURLTestHistory(RealTag(outboundGroup, N.NetworkTCP))
 		if groupHistory != nil {
@@ -704,28 +691,29 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 						delay, testErr := urltest.URLTest(testCtx, link, detour)
 						testChan <- urlTestResult{delay, testErr}
 					}()
+					var result urlTestResult
 					select {
-					case testResult := <-testChan:
-						return testResult
+					case result = <-testChan:
 					case <-testCtx.Done():
-						return urlTestResult{err: testCtx.Err()}
+						result.err = testCtx.Err()
 					}
-				})
-				if testResult.err != nil {
 					if b.ctx.Err() != nil {
-						return nil, nil
+						return result
 					}
-					b.logger.Debug("outbound ", tag, " unavailable: ", testResult.err)
-					b.access.Lock()
-					b.deleted = append(b.deleted, tag)
-					b.access.Unlock()
-				} else {
-					b.logger.Debug("outbound ", tag, " available: ", testResult.delay, "ms")
-					b.access.Lock()
-					b.stored[tag] = &adapter.URLTestHistory{
-						Time:  time.Now(),
-						Delay: testResult.delay,
+					if result.err != nil {
+						b.logger.Debug("outbound ", tag, " unavailable: ", result.err)
+						b.history.DeleteURLTestHistory(tag)
+					} else {
+						b.logger.Debug("outbound ", tag, " available: ", result.delay, "ms")
+						b.history.StoreURLTestHistory(tag, &adapter.URLTestHistory{
+							Time:  time.Now(),
+							Delay: result.delay,
+						})
 					}
+					return result
+				})
+				if testResult.err == nil && b.ctx.Err() == nil {
+					b.access.Lock()
 					b.result[tag] = testResult.delay
 					b.access.Unlock()
 				}
