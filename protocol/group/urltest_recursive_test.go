@@ -2,6 +2,7 @@ package group
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +17,7 @@ import (
 	"github.com/sagernet/sing-box/log"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/common/observable"
 
 	"github.com/stretchr/testify/require"
 )
@@ -76,6 +78,160 @@ func TestURLTestDoesNotDeduplicateDifferentURLs(t *testing.T) {
 	require.EqualValues(t, 1, secondRequests.Load())
 }
 
+func TestURLTestReusedResultDoesNotUpdateHistory(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	for _, test := range []struct {
+		name string
+		link string
+	}{
+		{name: "success", link: server.URL},
+		{name: "failure", link: "://invalid"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, _ := urlTestSessionFromContext(context.Background())
+			leaf := &recursiveURLTestOutbound{tag: "leaf"}
+			history := urltest.NewHistoryStorage()
+			logger := log.NewNOPFactory().Logger()
+			outbounds := []adapter.Outbound{leaf}
+			initial := &adapter.URLTestHistory{Time: time.Now(), Delay: 123}
+			history.StoreURLTestHistory(leaf.tag, initial)
+
+			first := URLTestOutbounds(ctx, nil, history, logger, outbounds, test.link, 0, true)
+			if test.name == "success" {
+				require.Contains(t, first, leaf.tag)
+				require.NotSame(t, initial, history.LoadURLTestHistory(leaf.tag))
+			} else {
+				require.Empty(t, first)
+				require.Nil(t, history.LoadURLTestHistory(leaf.tag))
+			}
+			updated := &adapter.URLTestHistory{Time: time.Now(), Delay: 456}
+			history.StoreURLTestHistory(leaf.tag, updated)
+			second := URLTestOutbounds(ctx, nil, history, logger, outbounds, test.link, 0, true)
+			require.Equal(t, first, second)
+			require.Same(t, updated, history.LoadURLTestHistory(leaf.tag))
+		})
+	}
+}
+
+func TestURLTestConcurrentReusedResultUpdatesHistoryOnce(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		failure bool
+	}{
+		{name: "success"},
+		{name: "failure", failure: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				writer.WriteHeader(http.StatusNoContent)
+			}))
+			defer server.Close()
+
+			started := make(chan struct{})
+			release := make(chan struct{})
+			leaf := &recursiveURLTestOutbound{tag: "leaf", dial: func(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+				select {
+				case started <- struct{}{}:
+				default:
+				}
+				select {
+				case <-release:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+				if test.failure {
+					return nil, errors.New("dial failed")
+				}
+				return (&net.Dialer{}).DialContext(ctx, network, destination.String())
+			}}
+			history := urltest.NewHistoryStorage()
+			history.StoreURLTestHistory(leaf.tag, &adapter.URLTestHistory{Time: time.Now(), Delay: 123})
+			subscriber := observable.NewSubscriber[struct{}](16)
+			history.AddUpdateHook(subscriber)
+			notifications, _ := subscriber.Subscription()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			ctx, _ = urlTestSessionFromContext(ctx)
+			const callers = 5
+			results := make(chan map[string]uint16, callers)
+			invoke := func() {
+				results <- URLTestOutbounds(ctx, nil, history, log.NewNOPFactory().Logger(), []adapter.Outbound{leaf}, server.URL, 0, true)
+			}
+			go invoke()
+			select {
+			case <-started:
+			case <-ctx.Done():
+				t.Fatal("test did not start")
+			}
+			ready := make(chan struct{}, callers-1)
+			for range callers - 1 {
+				go func() {
+					ready <- struct{}{}
+					invoke()
+				}()
+			}
+			for range callers - 1 {
+				<-ready
+			}
+			close(release)
+			for range callers {
+				select {
+				case result := <-results:
+					if test.failure {
+						require.Empty(t, result)
+					} else {
+						require.Contains(t, result, leaf.tag)
+					}
+				case <-ctx.Done():
+					t.Fatal("test did not finish")
+				}
+			}
+			require.EqualValues(t, 1, leaf.dialCount.Load())
+			require.Len(t, notifications, 1)
+			if test.failure {
+				require.Nil(t, history.LoadURLTestHistory(leaf.tag))
+			} else {
+				require.NotNil(t, history.LoadURLTestHistory(leaf.tag))
+			}
+		})
+	}
+}
+
+func TestURLTestCancellationPreservesHistory(t *testing.T) {
+	started := make(chan struct{})
+	leaf := &recursiveURLTestOutbound{tag: "leaf", dial: func(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}}
+	history := urltest.NewHistoryStorage()
+	initial := &adapter.URLTestHistory{Time: time.Now(), Delay: 123}
+	history.StoreURLTestHistory(leaf.tag, initial)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		URLTestOutbounds(ctx, nil, history, log.NewNOPFactory().Logger(), []adapter.Outbound{leaf}, "http://example.com", 0, true)
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("test did not start")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("test did not stop after cancellation")
+	}
+	require.Same(t, initial, history.LoadURLTestHistory(leaf.tag))
+}
+
 func TestURLTestSelectionKeepsCurrentWithinTolerance(t *testing.T) {
 	current := &recursiveURLTestOutbound{tag: "current"}
 	candidate := &recursiveURLTestOutbound{tag: "candidate"}
@@ -108,6 +264,7 @@ type recursiveURLTestOutbound struct {
 	adapter.Outbound
 	tag       string
 	dialCount atomic.Int32
+	dial      func(context.Context, string, M.Socksaddr) (net.Conn, error)
 }
 
 func (o *recursiveURLTestOutbound) Tag() string {
@@ -120,6 +277,9 @@ func (o *recursiveURLTestOutbound) Network() []string {
 
 func (o *recursiveURLTestOutbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	o.dialCount.Add(1)
+	if o.dial != nil {
+		return o.dial(ctx, network, destination)
+	}
 	return (&net.Dialer{}).DialContext(ctx, network, destination.String())
 }
 
