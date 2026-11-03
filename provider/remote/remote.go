@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
-	"fmt"
 	"io"
 	"io/fs"
 	"net/http"
@@ -54,8 +53,7 @@ type ProviderRemote struct {
 	hash             hash.HashType
 	infoMu           sync.RWMutex
 	lastEtag         string
-	lastOutOpts      []option.Outbound
-	lastEPOpts       []option.Endpoint
+	lastNodeOpts     []byte
 	lastUpdated      time.Time
 	subscriptionInfo adapter.SubscriptionInfo
 	ticker           *time.Ticker
@@ -259,34 +257,32 @@ func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
 	case http.StatusOK:
 	case http.StatusNotModified:
 		s.infoMu.Lock()
-		s.subscriptionInfo = info
+		if hasInfo {
+			s.subscriptionInfo = info
+		}
 		s.lastUpdated = time.Now()
 		s.infoMu.Unlock()
-		if s.cacheFile != nil {
-			saveSub := s.cacheFile.LoadSubscription(s.Tag())
-			if saveSub != nil {
-				if s.path != "" {
-					saveSub.Hash = s.hash
-				} else if hasInfo {
-					index := bytes.IndexByte(saveSub.Content, '\n')
-					if index != -1 {
-						saveSub.Content = append([]byte(infoStr+"\n"), saveSub.Content[index+1:]...)
-					}
-				}
-				saveSub.LastUpdated = s.lastUpdated
-				saveSub.URLHash = s.urlHash[:]
-				if err := s.cacheFile.SaveSubscription(s.Tag(), saveSub); err != nil {
-					s.logger.Error("save outbound provider cache file: ", err)
+		var content []byte
+		if hasInfo {
+			content = append([]byte("# "+infoStr+"\n"), s.lastNodeOpts...)
+			if s.path != "" {
+				if err = s.saveCacheFile(content); err != nil {
+					return E.Cause(err, "save outbound provider cache file")
 				}
 			}
 		}
-		if s.path != "" {
-			content, _ := json.Marshal(option.Options{
-				Outbounds: s.lastOutOpts,
-				Endpoints: s.lastEPOpts,
-			})
-			if err := s.saveCacheFile(hasInfo, info, content); err != nil {
-				return E.Cause(err, "save outbound provider cache file")
+		if s.cacheFile != nil {
+			if saveSub := s.cacheFile.LoadSubscription(s.Tag()); saveSub != nil {
+				saveSub.LastUpdated = s.lastUpdated
+				saveSub.URLHash = s.urlHash[:]
+				if s.path != "" {
+					saveSub.Hash = s.hash
+				} else if hasInfo {
+					saveSub.Content = content
+				}
+				if err = s.cacheFile.SaveSubscription(s.Tag(), saveSub); err != nil {
+					s.logger.Error("save outbound provider cache file: ", err)
+				}
 			}
 		}
 		s.logger.Info("update outbound provider ", s.Tag(), ": not modified")
@@ -299,48 +295,43 @@ func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
 		return err
 	}
 	content, _ := parser.DecodeBase64URLSafe(string(contentRaw))
-	if !hasInfo {
+	if !hasInfo && !strings.HasPrefix(strings.TrimSpace(content), "{") {
 		firstLine, others := getFirstLine(content)
 		if info, hasInfo = parseInfo(firstLine); hasInfo {
-			infoStr = firstLine
+			infoStr = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(firstLine), "#"))
 			content, _ = parser.DecodeBase64URLSafe(others)
 		}
 	}
 	if err := s.updateProviderFromContent(content); err != nil {
 		return err
 	}
-	s.UpdateGroups()
 	s.infoMu.Lock()
 	s.lastEtag = resp.Header.Get("Etag")
 	s.subscriptionInfo = info
 	s.lastUpdated = time.Now()
 	s.infoMu.Unlock()
-	if s.path != "" || s.cacheFile != nil {
-		content, _ := json.Marshal(option.Options{
-			Outbounds: s.lastOutOpts,
-			Endpoints: s.lastEPOpts,
-		})
-		if s.path != "" {
-			if err = s.saveCacheFile(hasInfo, info, content); err != nil {
-				return E.Cause(err, "save outbound provider cache file")
-			}
-		} else if hasInfo {
-			content = append([]byte(infoStr+"\n"), content...)
+	cacheContent := s.lastNodeOpts
+	if hasInfo {
+		cacheContent = append([]byte("# "+infoStr+"\n"), cacheContent...)
+	}
+	if s.path != "" {
+		if err = s.saveCacheFile(cacheContent); err != nil {
+			return E.Cause(err, "save outbound provider cache file")
 		}
-		if s.cacheFile != nil {
-			saveSub := &adapter.SavedBinary{
-				LastUpdated: s.lastUpdated,
-				LastEtag:    s.lastEtag,
-				URLHash:     s.urlHash[:],
-			}
-			if s.path != "" {
-				saveSub.Hash = s.hash
-			} else {
-				saveSub.Content = content
-			}
-			if err = s.cacheFile.SaveSubscription(s.Tag(), saveSub); err != nil {
-				s.logger.Error("save outbound provider cache file: ", err)
-			}
+	}
+	if s.cacheFile != nil {
+		saveSub := &adapter.SavedBinary{
+			LastUpdated: s.lastUpdated,
+			LastEtag:    s.lastEtag,
+			URLHash:     s.urlHash[:],
+		}
+		if s.path != "" {
+			saveSub.Hash = s.hash
+		} else {
+			saveSub.Content = cacheContent
+		}
+		if err = s.cacheFile.SaveSubscription(s.Tag(), saveSub); err != nil {
+			s.logger.Error("save outbound provider cache file: ", err)
 		}
 	}
 	s.logger.Info("updated outbound provider ", s.Tag())
@@ -396,13 +387,14 @@ func (s *ProviderRemote) loadCacheFile() (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	outboundOpts, endpointOpts = parser.ApplyOverrideDialer(outboundOpts, endpointOpts, s.overrideDialer, s.Tag())
+	outboundOpts, endpointOpts = s.filterOptions(outboundOpts, endpointOpts)
 	updateErr := s.UpdateNodes(outboundOpts, endpointOpts)
 	s.UpdateGroups()
 	if updateErr != nil {
 		return false, updateErr
 	}
-	s.lastOutOpts = outboundOpts
-	s.lastEPOpts = endpointOpts
+	s.lastNodeOpts = []byte(jsonContent)
 	s.lastUpdated, s.lastEtag = lastUpdated, lastEtag
 	return true, nil
 }
@@ -424,28 +416,18 @@ func (s *ProviderRemote) loopUpdate() {
 		s.ticker.Reset(s.updateInterval)
 	}
 	for {
-		runtime.GC()
 		select {
 		case <-s.ctx.Done():
 			return
 		case <-s.ticker.C:
 			s.updateOnce()
+			runtime.GC()
 			s.ticker.Reset(s.updateInterval)
 		}
 	}
 }
 
-func (s *ProviderRemote) saveCacheFile(hasInfo bool, info adapter.SubscriptionInfo, contentRaw []byte) error {
-	content := contentRaw
-	if hasInfo {
-		infoStr := fmt.Sprint(
-			"# upload=", info.Upload,
-			"; download=", info.Download,
-			"; total=", info.Total,
-			"; expire=", info.Expire,
-			";")
-		content = append([]byte(infoStr+"\n"), content...)
-	}
+func (s *ProviderRemote) saveCacheFile(content []byte) error {
 	dir := filepath.Dir(s.path)
 	err := filemanager.MkdirAll(s.ctx, dir, 0o755)
 	if err != nil {
@@ -460,6 +442,9 @@ func (s *ProviderRemote) saveCacheFile(hasInfo bool, info adapter.SubscriptionIn
 }
 
 func (s *ProviderRemote) stripInfoLine(content string) string {
+	if strings.HasPrefix(strings.TrimSpace(content), "{") {
+		return content
+	}
 	firstLine, others := getFirstLine(content)
 	info, ok := parseInfo(firstLine)
 	if !ok {
@@ -472,24 +457,36 @@ func (s *ProviderRemote) stripInfoLine(content string) string {
 }
 
 func (s *ProviderRemote) updateProviderFromContent(content string) error {
-	outboundOpts, endpointOpts, err := parser.ParseSubscription(s.ctx, content, s.overrideDialer, s.Tag())
+	outboundOpts, endpointOpts, err := parser.ParseSubscription(s.ctx, content)
 	if err != nil {
 		return err
 	}
+	source, err := json.Marshal(option.Options{
+		Outbounds: outboundOpts,
+		Endpoints: endpointOpts,
+	})
+	if err != nil {
+		return E.Cause(err, "marshal outbound provider source")
+	}
+	outboundOpts, endpointOpts = parser.ApplyOverrideDialer(outboundOpts, endpointOpts, s.overrideDialer, s.Tag())
+	outboundOpts, endpointOpts = s.filterOptions(outboundOpts, endpointOpts)
+	updateErr := s.UpdateNodes(outboundOpts, endpointOpts)
+	s.UpdateGroups()
+	if updateErr != nil {
+		return updateErr
+	}
+	s.lastNodeOpts = source
+	return nil
+}
+
+func (s *ProviderRemote) filterOptions(outboundOpts []option.Outbound, endpointOpts []option.Endpoint) ([]option.Outbound, []option.Endpoint) {
 	outboundOpts = common.Filter(outboundOpts, func(it option.Outbound) bool {
 		return (s.exclude == nil || !s.exclude.MatchString(it.Tag)) && (s.include == nil || s.include.MatchString(it.Tag))
 	})
 	endpointOpts = common.Filter(endpointOpts, func(it option.Endpoint) bool {
 		return (s.exclude == nil || !s.exclude.MatchString(it.Tag)) && (s.include == nil || s.include.MatchString(it.Tag))
 	})
-	updateErr := s.UpdateNodes(outboundOpts, endpointOpts)
-	s.UpdateGroups()
-	if updateErr != nil {
-		return updateErr
-	}
-	s.lastOutOpts = outboundOpts
-	s.lastEPOpts = endpointOpts
-	return nil
+	return outboundOpts, endpointOpts
 }
 
 func getFirstLine(content string) (string, string) {
