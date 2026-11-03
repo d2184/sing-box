@@ -29,6 +29,7 @@ import (
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	F "github.com/sagernet/sing/common/format"
+	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/service"
 	"github.com/sagernet/sing/service/filemanager"
 )
@@ -41,24 +42,23 @@ var _ adapter.Provider = (*ProviderRemote)(nil)
 
 type ProviderRemote struct {
 	provider.Adapter
-	ctx                 context.Context
-	fetchAccess         sync.Mutex
-	workers             sync.WaitGroup
-	cancel              context.CancelFunc
-	logger              log.ContextLogger
-	outbound            adapter.OutboundManager
-	provider            adapter.ProviderManager
-	cacheFile           adapter.CacheFile
-	httpClient          *http.Client
-	hash                hash.HashType
-	infoMu              sync.RWMutex
-	lastEtag            string
-	lastRawContent      string
-	lastUpdated         time.Time
-	hasSubscriptionInfo bool
-	subscriptionInfo    adapter.SubscriptionInfo
-	ticker              *time.Ticker
-	updating            atomic.Bool
+	ctx              context.Context
+	fetchAccess      sync.Mutex
+	workers          sync.WaitGroup
+	cancel           context.CancelFunc
+	logger           log.ContextLogger
+	outbound         adapter.OutboundManager
+	provider         adapter.ProviderManager
+	cacheFile        adapter.CacheFile
+	httpClient       *http.Client
+	hash             hash.HashType
+	infoMu           sync.RWMutex
+	lastEtag         string
+	lastNodeOpts     []byte
+	lastUpdated      time.Time
+	subscriptionInfo adapter.SubscriptionInfo
+	ticker           *time.Ticker
+	updating         atomic.Bool
 
 	httpClientOptions *option.HTTPClientOptions
 	downloadDetour    string
@@ -257,35 +257,31 @@ func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
 	switch resp.StatusCode {
 	case http.StatusOK:
 	case http.StatusNotModified:
+		var cacheContent []byte
+		if hasInfo {
+			cacheContent = encodeCachedContent(true, info, s.lastNodeOpts)
+			if s.path != "" {
+				if err := s.saveCacheFile(cacheContent); err != nil {
+					return E.Cause(err, "save outbound provider cache file")
+				}
+			}
+		}
 		now := time.Now()
-		if !hasInfo {
-			s.infoMu.RLock()
-			if s.hasSubscriptionInfo {
-				info = s.subscriptionInfo
-				hasInfo = true
-			}
-			s.infoMu.RUnlock()
-		}
-		if s.path != "" {
-			if err := s.saveCacheFile(hasInfo, info, []byte(s.lastRawContent)); err != nil {
-				return E.Cause(err, "save outbound provider cache file")
-			}
-		}
 		s.infoMu.Lock()
-		s.subscriptionInfo = info
-		s.hasSubscriptionInfo = hasInfo
+		if hasInfo {
+			s.subscriptionInfo = info
+		}
 		s.lastUpdated = now
 		s.infoMu.Unlock()
 		if s.cacheFile != nil {
-			saveSub := s.cacheFile.LoadSubscription(s.Tag())
-			if saveSub != nil {
-				if s.path != "" {
-					saveSub.Hash = s.hash
-				} else {
-					saveSub.Content = encodeCachedContent(hasInfo, info, []byte(s.lastRawContent))
-				}
+			if saveSub := s.cacheFile.LoadSubscription(s.Tag()); saveSub != nil {
 				saveSub.LastUpdated = now
 				saveSub.URLHash = s.urlHash[:]
+				if s.path != "" {
+					saveSub.Hash = s.hash
+				} else if hasInfo {
+					saveSub.Content = cacheContent
+				}
 				if err := s.cacheFile.SaveSubscription(s.Tag(), saveSub); err != nil {
 					s.logger.Error("save outbound provider cache file: ", err)
 				}
@@ -301,7 +297,7 @@ func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
 		return err
 	}
 	content, _ := parser.DecodeBase64URLSafe(string(contentRaw))
-	if !hasInfo {
+	if !hasInfo && !strings.HasPrefix(strings.TrimSpace(content), "{") {
 		firstLine, others := getFirstLine(content)
 		if info, hasInfo = parseInfo(firstLine); hasInfo {
 			content, _ = parser.DecodeBase64URLSafe(others)
@@ -310,18 +306,15 @@ func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
 	if err := s.updateProviderFromContent(content); err != nil {
 		return err
 	}
-	s.lastRawContent = content
-	s.UpdateGroups()
 	s.infoMu.Lock()
 	s.lastEtag = resp.Header.Get("Etag")
 	s.subscriptionInfo = info
-	s.hasSubscriptionInfo = hasInfo
 	s.lastUpdated = time.Now()
 	s.infoMu.Unlock()
 	if s.path != "" || s.cacheFile != nil {
-		rawBytes := []byte(content)
+		cacheContent := encodeCachedContent(hasInfo, info, s.lastNodeOpts)
 		if s.path != "" {
-			if err = s.saveCacheFile(hasInfo, info, rawBytes); err != nil {
+			if err := s.saveCacheFile(cacheContent); err != nil {
 				return E.Cause(err, "save outbound provider cache file")
 			}
 		}
@@ -334,9 +327,9 @@ func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
 			if s.path != "" {
 				saveSub.Hash = s.hash
 			} else {
-				saveSub.Content = encodeCachedContent(hasInfo, info, rawBytes)
+				saveSub.Content = cacheContent
 			}
-			if err = s.cacheFile.SaveSubscription(s.Tag(), saveSub); err != nil {
+			if err := s.cacheFile.SaveSubscription(s.Tag(), saveSub); err != nil {
 				s.logger.Error("save outbound provider cache file: ", err)
 			}
 		}
@@ -393,7 +386,6 @@ func (s *ProviderRemote) loadCacheFile() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	s.UpdateGroups()
 	if isRaw {
 		s.lastUpdated, s.lastEtag = lastUpdated, lastEtag
 	} else {
@@ -410,7 +402,6 @@ func (s *ProviderRemote) loadFromContent(contentRaw []byte) (bool, error) {
 	if err := s.updateProviderFromContent(content); err != nil {
 		return false, err
 	}
-	s.lastRawContent = content
 	return isRaw, nil
 }
 
@@ -425,10 +416,12 @@ func (s *ProviderRemote) decodeContent(contentRaw []byte) (string, bool) {
 		content = others
 		firstLine, others = getFirstLine(content)
 	}
+	if strings.HasPrefix(strings.TrimSpace(content), "{") {
+		return content, isRaw
+	}
 	if info, ok := parseInfo(firstLine); ok {
 		s.infoMu.Lock()
 		s.subscriptionInfo = info
-		s.hasSubscriptionInfo = true
 		s.infoMu.Unlock()
 		content, _ = parser.DecodeBase64URLSafe(others)
 	}
@@ -452,12 +445,12 @@ func (s *ProviderRemote) loopUpdate() {
 		s.ticker.Reset(s.updateInterval)
 	}
 	for {
-		runtime.GC()
 		select {
 		case <-s.ctx.Done():
 			return
 		case <-s.ticker.C:
 			s.updateOnce()
+			runtime.GC()
 			s.ticker.Reset(s.updateInterval)
 		}
 	}
@@ -480,8 +473,7 @@ func encodeCachedContent(hasInfo bool, info adapter.SubscriptionInfo, contentRaw
 	return append([]byte(prefix.String()), contentRaw...)
 }
 
-func (s *ProviderRemote) saveCacheFile(hasInfo bool, info adapter.SubscriptionInfo, contentRaw []byte) error {
-	content := encodeCachedContent(hasInfo, info, contentRaw)
+func (s *ProviderRemote) saveCacheFile(content []byte) error {
 	dir := filepath.Dir(s.path)
 	err := filemanager.MkdirAll(s.ctx, dir, 0o755)
 	if err != nil {
@@ -496,22 +488,36 @@ func (s *ProviderRemote) saveCacheFile(hasInfo bool, info adapter.SubscriptionIn
 }
 
 func (s *ProviderRemote) updateProviderFromContent(content string) error {
-	outboundOpts, endpointOpts, err := parser.ParseSubscription(s.ctx, content, s.overrideDialer, s.Tag())
+	outboundOpts, endpointOpts, err := parser.ParseSubscription(s.ctx, content)
 	if err != nil {
 		return err
 	}
+	source, err := json.Marshal(option.Options{
+		Outbounds: outboundOpts,
+		Endpoints: endpointOpts,
+	})
+	if err != nil {
+		return E.Cause(err, "marshal outbound provider source")
+	}
+	outboundOpts, endpointOpts = parser.ApplyOverrideDialer(outboundOpts, endpointOpts, s.overrideDialer, s.Tag())
+	outboundOpts, endpointOpts = s.filterOptions(outboundOpts, endpointOpts)
+	updateErr := s.UpdateNodes(outboundOpts, endpointOpts)
+	s.UpdateGroups()
+	if updateErr != nil {
+		return updateErr
+	}
+	s.lastNodeOpts = source
+	return nil
+}
+
+func (s *ProviderRemote) filterOptions(outboundOpts []option.Outbound, endpointOpts []option.Endpoint) ([]option.Outbound, []option.Endpoint) {
 	outboundOpts = common.Filter(outboundOpts, func(it option.Outbound) bool {
 		return (s.exclude == nil || !s.exclude.MatchString(it.Tag)) && (s.include == nil || s.include.MatchString(it.Tag))
 	})
 	endpointOpts = common.Filter(endpointOpts, func(it option.Endpoint) bool {
 		return (s.exclude == nil || !s.exclude.MatchString(it.Tag)) && (s.include == nil || s.include.MatchString(it.Tag))
 	})
-	updateErr := s.UpdateNodes(outboundOpts, endpointOpts)
-	s.UpdateGroups()
-	if updateErr != nil {
-		return updateErr
-	}
-	return nil
+	return outboundOpts, endpointOpts
 }
 
 func getFirstLine(content string) (string, string) {

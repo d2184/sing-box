@@ -17,19 +17,23 @@ var subscriptionParsers = []func(ctx context.Context, content string) ([]option.
 	ParseRawSubscription,
 }
 
-func ParseSubscription(ctx context.Context, content string, overrideDialerOptions *option.OverrideDialerOptions, providerTag string) ([]option.Outbound, []option.Endpoint, error) {
+func ParseSubscription(ctx context.Context, content string) ([]option.Outbound, []option.Endpoint, error) {
 	var pErr error
 	for _, parser := range subscriptionParsers {
 		outbounds, endpoints, err := parser(ctx, content)
 		if len(outbounds) > 0 || len(endpoints) > 0 {
-			tags := providerTags(outbounds, endpoints)
-			return overrideOutbounds(outbounds, overrideDialerOptions, tags, providerTag),
-				overrideEndpoints(endpoints, overrideDialerOptions, tags, providerTag),
-				nil
+			return outbounds, endpoints, nil
 		}
 		pErr = E.Errors(pErr, err)
 	}
 	return nil, nil, E.Cause(pErr, "no servers found")
+}
+
+// ApplyOverrideDialer modifies freshly parsed node options in place.
+func ApplyOverrideDialer(outbounds []option.Outbound, endpoints []option.Endpoint, overrideDialerOptions *option.OverrideDialerOptions, providerTag string) ([]option.Outbound, []option.Endpoint) {
+	tags := providerTags(outbounds, endpoints)
+	return overrideOutbounds(outbounds, overrideDialerOptions, tags, providerTag),
+		overrideEndpoints(endpoints, overrideDialerOptions, tags, providerTag)
 }
 
 func providerTags(outbounds []option.Outbound, endpoints []option.Endpoint) []string {
