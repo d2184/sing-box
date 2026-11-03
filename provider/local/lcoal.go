@@ -153,10 +153,11 @@ func (s *ProviderLocal) reloadFile(path string) error {
 		return closeErr
 	}
 	s.lastUpdated = fileInfo.ModTime()
-	outboundOpts, endpointOpts, err := parser.ParseSubscription(s.ctx, string(content), s.overrideDialer, s.Tag())
+	outboundOpts, endpointOpts, err := parser.ParseSubscription(s.ctx, string(content))
 	if err != nil {
 		return err
 	}
+	outboundOpts, endpointOpts = parser.ApplyOverrideDialer(outboundOpts, endpointOpts, s.overrideDialer, s.Tag())
 	updateErr := s.UpdateNodes(outboundOpts, endpointOpts)
 	s.UpdateGroups()
 	if updateErr != nil {
