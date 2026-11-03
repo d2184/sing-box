@@ -649,25 +649,28 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 						delay, testErr := urltest.URLTest(testCtx, link, detour)
 						testChan <- urlTestResult{delay, testErr}
 					}()
+					var result urlTestResult
 					select {
-					case testResult := <-testChan:
-						return testResult
+					case result = <-testChan:
 					case <-testCtx.Done():
-						return urlTestResult{err: testCtx.Err()}
+						result.err = testCtx.Err()
 					}
-				})
-				if testResult.err != nil {
 					if b.ctx.Err() != nil {
-						return nil, nil
+						return result
 					}
-					b.logger.Debug("outbound ", tag, " unavailable: ", testResult.err)
-					b.history.DeleteURLTestHistory(tag)
-				} else {
-					b.logger.Debug("outbound ", tag, " available: ", testResult.delay, "ms")
-					b.history.StoreURLTestHistory(tag, &adapter.URLTestHistory{
-						Time:  time.Now(),
-						Delay: testResult.delay,
-					})
+					if result.err != nil {
+						b.logger.Debug("outbound ", tag, " unavailable: ", result.err)
+						b.history.DeleteURLTestHistory(tag)
+					} else {
+						b.logger.Debug("outbound ", tag, " available: ", result.delay, "ms")
+						b.history.StoreURLTestHistory(tag, &adapter.URLTestHistory{
+							Time:  time.Now(),
+							Delay: result.delay,
+						})
+					}
+					return result
+				})
+				if testResult.err == nil && b.ctx.Err() == nil {
 					b.access.Lock()
 					b.result[tag] = testResult.delay
 					b.access.Unlock()
