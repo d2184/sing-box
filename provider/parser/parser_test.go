@@ -35,11 +35,11 @@ func TestParseBoxSubscriptionMalformedInputDoesNotPanic(t *testing.T) {
 		payload string
 		errPart string
 	}{
-		{"outbounds not array", `{"outbounds":"bad"}`, "expected array"},
-		{"outbound element null", `{"outbounds":[null]}`, "outbound[0]"},
-		{"outbound element scalar", `{"outbounds":[123]}`, "outbound[0]"},
-		{"outbound missing type", `{"outbounds":[{"tag":"a"}]}`, "missing type in outbound[0]"},
-		{"outbound non-string type", `{"outbounds":[{"type":123}]}`, "invalid type in outbound[0]"},
+		{"outbounds not array", `{"outbounds":"bad"}`, "outbounds must be an array"},
+		{"outbound element null", `{"outbounds":[null]}`, "outbounds[0] must be an object"},
+		{"outbound element scalar", `{"outbounds":[123]}`, "outbounds[0] must be an object"},
+		{"outbound missing type", `{"outbounds":[{"tag":"a"}]}`, "missing type in outbounds[0]"},
+		{"outbound non-string type", `{"outbounds":[{"type":123}]}`, "outbounds[0].type must be a string"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			require.NotPanics(t, func() {
