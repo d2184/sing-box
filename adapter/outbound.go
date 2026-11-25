@@ -59,10 +59,10 @@ type Referrer interface {
 	References() (outbounds []string, dnsServers []string)
 }
 
-// DynamicOutboundManager supports provider-owned components without allowing
-// duplicate tags in the static configuration.
+// DynamicOutboundManager serializes provider batches across both node kinds.
 type DynamicOutboundManager interface {
 	OutboundManager
-	Replace(ctx context.Context, router Router, logger log.ContextLogger, tag string, componentType string, options any) error
-	Remove(tag string) error
+	LockProviderUpdate() (unlock func())
+	Replace(ctx context.Context, router Router, logger log.ContextLogger, tag string, componentType string, options any, previous Outbound) (Outbound, error)
+	Remove(previous Outbound) error
 }

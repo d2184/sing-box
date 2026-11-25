@@ -77,6 +77,8 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 	if err != nil {
 		return err
 	}
+	m.mutation.Lock()
+	defer m.mutation.Unlock()
 	m.access.Lock()
 	defer m.access.Unlock()
 	_, loaded := m.endpointByTag[tag]
@@ -88,12 +90,16 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 	return nil
 }
 
-func (m *Manager) Replace(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, endpointType string, options any) error {
+func (m *Manager) Replace(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, endpointType string, options any, previous adapter.Outbound) (adapter.Endpoint, error) {
 	m.mutation.Lock()
 	defer m.mutation.Unlock()
+	old := m.endpointByTag[tag]
+	if old != previous {
+		return nil, E.New("provider node tag conflict: ", tag)
+	}
 	node, err := m.registry.Create(ctx, router, logger, tag, endpointType, options)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if m.lifecycle != nil {
 		for _, stage := range adapter.ListStartStages {
@@ -107,12 +113,11 @@ func (m *Manager) Replace(ctx context.Context, router adapter.Router, logger log
 				break
 			}
 			if err = m.lifecycle.Start("endpoint/"+node.Type()+"["+tag+"]", node, stage); err != nil {
-				return E.Errors(err, m.lifecycle.Remove(node))
+				return nil, E.Errors(err, m.lifecycle.Remove(node))
 			}
 		}
 	}
 	m.access.Lock()
-	old := m.endpointByTag[tag]
 	if old == nil {
 		m.endpoints = append(m.endpoints, node)
 	} else {
@@ -136,15 +141,16 @@ func (m *Manager) Replace(ctx context.Context, router adapter.Router, logger log
 			logger.Error(closeErr, "close replaced endpoint ", tag)
 		}
 	}
-	return nil
+	return node, nil
 }
 
-func (m *Manager) Remove(tag string) error {
+func (m *Manager) Remove(previous adapter.Outbound) error {
+	tag := previous.Tag()
 	m.mutation.Lock()
 	defer m.mutation.Unlock()
 	m.access.Lock()
 	old := m.endpointByTag[tag]
-	if old == nil {
+	if old != previous {
 		m.access.Unlock()
 		return nil
 	}

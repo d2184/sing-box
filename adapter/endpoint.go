@@ -34,10 +34,9 @@ type EndpointManager interface {
 	Create(ctx context.Context, router Router, logger log.ContextLogger, tag string, endpointType string, options any) error
 }
 
-// DynamicEndpointManager supports provider-owned components without allowing
-// duplicate tags in the static configuration.
+// DynamicEndpointManager mutates endpoints by their previous instance.
 type DynamicEndpointManager interface {
 	EndpointManager
-	Replace(ctx context.Context, router Router, logger log.ContextLogger, tag string, componentType string, options any) error
-	Remove(tag string) error
+	Replace(ctx context.Context, router Router, logger log.ContextLogger, tag string, componentType string, options any, previous Outbound) (Endpoint, error)
+	Remove(previous Outbound) error
 }
