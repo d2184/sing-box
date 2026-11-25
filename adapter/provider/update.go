@@ -18,6 +18,7 @@ type nodeConfig struct {
 type updateNode struct {
 	nodeConfig
 	tag          string
+	current      adapter.Outbound
 	dependencies []string
 }
 
@@ -38,10 +39,33 @@ func (a *Adapter) UpdateNodes(outOpts []option.Outbound, epOpts []option.Endpoin
 		}
 		nodes[tag] = updateNode{tag: tag, nodeConfig: nodeConfig{kind: opt.Type, sourceTag: opt.Tag, options: opt.Options, endpoint: true}}
 	}
+	unlock := a.outbound.LockProviderUpdate()
+	defer unlock()
+	if err := a.ctx.Err(); err != nil {
+		return err
+	}
 	a.outboundsAccess.RLock()
 	previousOutbounds, previousEndpoints := a.outbounds, a.endpoints
 	previousOutByTag, previousEPByTag := a.outboundsByTag, a.endpointsByTag
 	a.outboundsAccess.RUnlock()
+	for _, tag := range tags {
+		outbound, _ := a.outbound.Outbound(tag)
+		var endpoint adapter.Endpoint
+		if a.endpoint != nil {
+			endpoint, _ = a.endpoint.Get(tag)
+		}
+		if (outbound != nil && outbound != previousOutByTag[tag] && outbound != previousEPByTag[tag]) ||
+			(endpoint != nil && endpoint != previousEPByTag[tag]) {
+			return E.New("provider node tag conflict: ", tag)
+		}
+		node := nodes[tag]
+		if node.endpoint {
+			node.current = endpoint
+		} else if outbound == previousOutByTag[tag] {
+			node.current = outbound
+		}
+		nodes[tag] = node
+	}
 	ordered, err := a.orderNodes(nodes, tags)
 	if err != nil {
 		return err
@@ -58,40 +82,16 @@ applyNodes:
 				continue applyNodes
 			}
 		}
-		ownedOut, ownedEP := previousOutByTag[node.tag], previousEPByTag[node.tag]
-		if ownedOut == nil && ownedEP == nil {
-			if _, exists := a.outbound.Outbound(node.tag); exists {
-				failed[node.tag] = true
-				updateErrors = append(updateErrors, E.New("provider node tag conflicts with existing outbound: ", node.tag))
-				continue
-			}
-			if a.endpoint != nil {
-				if _, exists := a.endpoint.Get(node.tag); exists {
-					failed[node.tag] = true
-					updateErrors = append(updateErrors, E.New("provider node tag conflicts with existing endpoint: ", node.tag))
-					continue
-				}
-			}
-		}
-		var current, previous adapter.Outbound
-		if node.endpoint {
-			current, _ = a.endpoint.Get(node.tag)
-			previous = ownedEP
-		} else {
-			current, _ = a.outbound.Outbound(node.tag)
-			previous = ownedOut
-		}
-		if current == nil || current != previous || !reflect.DeepEqual(node.nodeConfig, a.appliedOptions[node.tag]) {
+		current := node.current
+		if current == nil || !reflect.DeepEqual(node.nodeConfig, a.appliedOptions[node.tag]) {
 			ctx := adapter.WithContext(a.ctx, &adapter.InboundContext{Outbound: node.tag})
 			var replaceErr error
 			if node.endpoint {
 				logger := a.logFactory.NewLogger("endpoint/" + node.kind + "[" + node.tag + "]")
-				replaceErr = a.endpoint.Replace(ctx, a.router, logger, node.tag, node.kind, node.options)
-				current, _ = a.endpoint.Get(node.tag)
+				current, replaceErr = a.endpoint.Replace(ctx, a.router, logger, node.tag, node.kind, node.options, node.current)
 			} else {
 				logger := a.logFactory.NewLogger("outbound/" + node.kind + "[" + node.tag + "]")
-				replaceErr = a.outbound.Replace(ctx, a.router, logger, node.tag, node.kind, node.options)
-				current, _ = a.outbound.Outbound(node.tag)
+				current, replaceErr = a.outbound.Replace(ctx, a.router, logger, node.tag, node.kind, node.options, node.current)
 			}
 			if replaceErr != nil {
 				updateErrors = append(updateErrors, E.Cause(replaceErr, node.tag))
@@ -99,12 +99,13 @@ applyNodes:
 				continue
 			}
 			// Remove the old kind before dependent nodes look up this tag.
+			ownedOut, ownedEP := previousOutByTag[node.tag], previousEPByTag[node.tag]
 			if node.endpoint && ownedOut != nil {
-				if err := a.outbound.Remove(node.tag); err != nil {
+				if err := a.outbound.Remove(ownedOut); err != nil {
 					a.logger.Error(err, "close outbound [", node.tag, "]")
 				}
 			} else if !node.endpoint && ownedEP != nil {
-				if err := a.endpoint.Remove(node.tag); err != nil {
+				if err := a.endpoint.Remove(ownedEP); err != nil {
 					a.logger.Error(err, "close endpoint [", node.tag, "]")
 				}
 			}
@@ -218,7 +219,7 @@ func (a *Adapter) orderNodes(nodes map[string]updateNode, tags []string) ([]upda
 	return ordered, nil
 }
 
-func (a *Adapter) reconcileNodes(tags []string, previous []adapter.Outbound, selected, switched map[string]adapter.Outbound, remove func(string) error) []adapter.Outbound {
+func (a *Adapter) reconcileNodes(tags []string, previous []adapter.Outbound, selected, switched map[string]adapter.Outbound, remove func(adapter.Outbound) error) []adapter.Outbound {
 	ordered := make([]adapter.Outbound, 0, len(selected))
 	listed := make(map[string]bool, len(tags))
 	for _, tag := range tags {
@@ -231,7 +232,7 @@ func (a *Adapter) reconcileNodes(tags []string, previous []adapter.Outbound, sel
 		tag := old.Tag()
 		if node := selected[tag]; node == nil {
 			if switched[tag] == nil {
-				if err := remove(tag); err != nil {
+				if err := remove(old); err != nil {
 					a.logger.Error(err, "close provider node [", tag, "]")
 				}
 			}

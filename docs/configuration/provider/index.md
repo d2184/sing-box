@@ -78,6 +78,8 @@ Tag of the provider.
 
 The node `node_name` from `provider` will be tagged as `provider/node_name`.
 
+If an imported tag conflicts with a static outbound or endpoint, or a node from another provider, the entire provider update is rejected.
+
 ### Local or Remote Fields
 
 #### health_check

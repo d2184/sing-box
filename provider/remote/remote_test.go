@@ -76,7 +76,7 @@ func newCacheTestProvider(cache adapter.CacheFile, url string) (*ProviderRemote,
 	logger := logFactory.NewLogger("test")
 	endpoints := endpoint.NewManager(endpoint.NewRegistry())
 	outbounds := outbound.NewManager(registry, endpoints, "")
-	if err := outbounds.Replace(ctx, nil, logger, "new-detour", C.TypeSOCKS, &option.SOCKSOutboundOptions{}); err != nil {
+	if err := outbounds.Create(ctx, nil, logger, "new-detour", C.TypeSOCKS, &option.SOCKSOutboundOptions{}); err != nil {
 		panic(err)
 	}
 	return &ProviderRemote{

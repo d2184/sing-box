@@ -78,6 +78,8 @@
 
 来自 `provider` 的节点 `node_name`，导入后的标签为 `provider/node_name`。
 
+如果导入后的标签与静态出站、静态端点或其他订阅源的节点冲突，本次订阅源更新会被拒绝。
+
 ### 本地或远程字段
 
 #### health_check

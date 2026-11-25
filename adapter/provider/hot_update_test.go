@@ -337,71 +337,6 @@ func TestProviderOrdersCrossKindDependenciesAndRejectsCycles(t *testing.T) {
 	require.Len(t, order, 3, "cycle rejection must not replace existing nodes")
 }
 
-func TestProviderDoesNotOverwriteStaticOutboundOrEndpoint(t *testing.T) {
-	ctx := service.ContextWithPtr(context.Background(), urltest.NewHistoryStorage())
-	factory := log.NewNOPFactory()
-	logger := factory.Logger()
-	outRegistry, epRegistry := outbound.NewRegistry(), endpoint.NewRegistry()
-	outbound.Register[nodeOptions](outRegistry, "test", func(_ context.Context, _ adapter.Router, _ log.ContextLogger, tag string, options nodeOptions) (adapter.Outbound, error) {
-		return &testNode{Adapter: outbound.NewAdapter("test", tag, []string{"tcp"}, nil), options: options}, nil
-	})
-	endpoint.Register[nodeOptions](epRegistry, "test", func(_ context.Context, _ adapter.Router, _ log.ContextLogger, tag string, options nodeOptions) (adapter.Endpoint, error) {
-		return &testEndpointNode{testNode: &testNode{Adapter: outbound.NewAdapter("test", tag, []string{"tcp"}, nil), options: options}}, nil
-	})
-	epMgr := endpoint.NewManager(epRegistry)
-	outMgr := outbound.NewManager(outRegistry, epMgr, "")
-	require.NoError(t, outMgr.Create(ctx, nil, logger, "p/static-out", "test", &nodeOptions{Revision: 1}))
-	require.NoError(t, epMgr.Create(ctx, nil, logger, "p/static-ep", "test", &nodeOptions{Revision: 1}))
-	scope := adapter.NewScope(ctx, logger)
-	t.Cleanup(func() { require.NoError(t, scope.Close()) })
-	for _, stage := range adapter.ListStartStages {
-		require.NoError(t, scope.Start("endpoint", epMgr, stage))
-		require.NoError(t, scope.Start("outbound", outMgr, stage))
-	}
-	staticOut, _ := outMgr.Outbound("p/static-out")
-	staticEP, _ := epMgr.Get("p/static-ep")
-
-	p := provider.NewAdapter(ctx, nil, outMgr, epMgr, factory, logger, "p", "inline", option.ProviderHealthCheckOptions{})
-	require.NoError(t, p.Start())
-	t.Cleanup(func() { require.NoError(t, p.Close()) })
-
-	err := p.UpdateNodes(
-		[]option.Outbound{
-			{Type: "test", Tag: "static-out", Options: &nodeOptions{Revision: 2}},
-			{Type: "test", Tag: "owned", Options: &nodeOptions{Revision: 1}},
-		},
-		[]option.Endpoint{
-			{Type: "test", Tag: "static-ep", Options: &nodeOptions{Revision: 2}},
-		},
-	)
-	require.Error(t, err)
-	require.ErrorContains(t, err, "conflicts with existing")
-
-	gotOut, found := outMgr.Outbound("p/static-out")
-	require.True(t, found)
-	require.Same(t, staticOut, gotOut)
-	require.Zero(t, staticOut.(*testNode).closes.Load())
-
-	gotEP, found := epMgr.Get("p/static-ep")
-	require.True(t, found)
-	require.Same(t, staticEP, gotEP)
-	require.Zero(t, staticEP.(*testEndpointNode).closes.Load())
-
-	_, ownedFound := p.Outbound("p/owned")
-	require.True(t, ownedFound)
-	_, conflictOwned := p.Outbound("p/static-out")
-	require.False(t, conflictOwned)
-
-	// Removing everything from provider must leave static objects intact.
-	require.NoError(t, p.UpdateNodes(nil, nil))
-	gotOut, found = outMgr.Outbound("p/static-out")
-	require.True(t, found)
-	require.Same(t, staticOut, gotOut)
-	gotEP, found = epMgr.Get("p/static-ep")
-	require.True(t, found)
-	require.Same(t, staticEP, gotEP)
-}
-
 func TestProviderCrossKindReplacementFailurePreservesOldNode(t *testing.T) {
 	ctx := service.ContextWithPtr(context.Background(), urltest.NewHistoryStorage())
 	factory := log.NewNOPFactory()
@@ -466,4 +401,142 @@ func TestProviderCrossKindReplacementFailurePreservesOldNode(t *testing.T) {
 	require.Zero(t, newEP.(*testEndpointNode).closes.Load())
 	require.Len(t, p.Outbounds(), 1)
 	require.Same(t, newEP, p.Outbounds()[0])
+}
+
+func TestProviderRejectsNodeTagCollision(t *testing.T) {
+	const tag = "p/nested/shared"
+	for _, owner := range []string{"static", "provider"} {
+		for _, existingKind := range []string{"outbound", "endpoint"} {
+			for _, incomingKind := range []string{"outbound", "endpoint"} {
+				t.Run(owner+"/"+existingKind+"/"+incomingKind, func(t *testing.T) {
+					ctx, factory, out, ep := newCollisionTestManagers()
+					logger := factory.Logger()
+					if owner == "provider" {
+						source := provider.NewAdapter(ctx, nil, out, ep, factory, logger, "p/nested", "inline", option.ProviderHealthCheckOptions{})
+						t.Cleanup(func() { require.NoError(t, source.Close()) })
+						outs, eps := collisionTestOptions(existingKind, "shared")
+						require.NoError(t, source.UpdateNodes(outs, eps))
+					} else if existingKind == "outbound" {
+						require.NoError(t, out.Create(ctx, nil, logger, tag, "test", &nodeOptions{}))
+					} else {
+						require.NoError(t, ep.Create(ctx, nil, logger, tag, "test", &nodeOptions{}))
+					}
+					existing, found := out.Outbound(tag)
+					require.True(t, found)
+
+					subscription := provider.NewAdapter(ctx, nil, out, ep, factory, logger, "p", "inline", option.ProviderHealthCheckOptions{})
+					t.Cleanup(func() { require.NoError(t, subscription.Close()) })
+					initial, _ := collisionTestOptions("outbound", "retained")
+					require.NoError(t, subscription.UpdateNodes(initial, nil))
+					retained, _ := subscription.Outbound("p/retained")
+					outs, eps := collisionTestOptions(incomingKind, "nested/shared")
+					unrelated, _ := collisionTestOptions("outbound", "unrelated")
+					require.ErrorContains(t, subscription.UpdateNodes(append(unrelated, outs...), eps), "provider node tag conflict: "+tag)
+					require.Equal(t, []adapter.Outbound{retained}, subscription.Outbounds())
+					_, found = out.Outbound("p/unrelated")
+					require.False(t, found)
+					current, _ := out.Outbound("p/retained")
+					require.Same(t, retained, current)
+					require.NoError(t, subscription.Close())
+					current, _ = out.Outbound(tag)
+					require.Same(t, existing, current)
+					_, found = ep.Get(tag)
+					require.Equal(t, existingKind == "endpoint", found)
+				})
+			}
+		}
+	}
+}
+
+func TestProviderConcurrentNodeTagCollision(t *testing.T) {
+	ctx, factory, out, ep := newCollisionTestManagers()
+	first := provider.NewAdapter(ctx, nil, out, ep, factory, factory.Logger(), "p", "inline", option.ProviderHealthCheckOptions{})
+	second := provider.NewAdapter(ctx, nil, out, ep, factory, factory.Logger(), "p/nested", "inline", option.ProviderHealthCheckOptions{})
+	t.Cleanup(func() { require.NoError(t, first.Close()) })
+	t.Cleanup(func() { require.NoError(t, second.Close()) })
+	outs, _ := collisionTestOptions("outbound", "nested/shared")
+	_, eps := collisionTestOptions("endpoint", "shared")
+	start := make(chan struct{})
+	firstErr, secondErr := make(chan error, 1), make(chan error, 1)
+	go func() {
+		<-start
+		firstErr <- first.UpdateNodes(outs, nil)
+	}()
+	go func() {
+		<-start
+		secondErr <- second.UpdateNodes(nil, eps)
+	}()
+	close(start)
+
+	const tag = "p/nested/shared"
+	winner, loser := &first, &second
+	winnerErr, loserErr := <-firstErr, <-secondErr
+	if winnerErr != nil {
+		winner, loser = loser, winner
+		winnerErr, loserErr = loserErr, winnerErr
+	}
+	require.NoError(t, winnerErr)
+	require.ErrorContains(t, loserErr, "provider node tag conflict: "+tag)
+	require.Empty(t, loser.Outbounds())
+	require.NoError(t, loser.Close())
+	expected, found := winner.Outbound(tag)
+	require.True(t, found)
+	current, _ := out.Outbound(tag)
+	require.Same(t, expected, current)
+}
+
+func TestProviderCleanupLeavesNewInstancesWithReusedTags(t *testing.T) {
+	for _, operation := range []string{"refresh", "close"} {
+		t.Run(operation, func(t *testing.T) {
+			ctx, factory, out, ep := newCollisionTestManagers()
+			logger := factory.Logger()
+			subscription := provider.NewAdapter(ctx, nil, out, ep, factory, logger, "p", "inline", option.ProviderHealthCheckOptions{})
+			t.Cleanup(func() { require.NoError(t, subscription.Close()) })
+			outs, _ := collisionTestOptions("outbound", "out")
+			_, eps := collisionTestOptions("endpoint", "ep")
+			require.NoError(t, subscription.UpdateNodes(outs, eps))
+			oldOutbound, _ := subscription.Outbound("p/out")
+			oldEndpoint, _ := subscription.Outbound("p/ep")
+			require.NoError(t, out.Remove(oldOutbound))
+			require.NoError(t, ep.Remove(oldEndpoint))
+			require.NoError(t, out.Create(ctx, nil, logger, "p/out", "test", &nodeOptions{}))
+			require.NoError(t, ep.Create(ctx, nil, logger, "p/ep", "test", &nodeOptions{}))
+			newOutbound, _ := out.Outbound("p/out")
+			newEndpoint, _ := ep.Get("p/ep")
+			_, err := out.Replace(ctx, nil, logger, "p/out", "test", &nodeOptions{}, oldOutbound)
+			require.ErrorContains(t, err, "provider node tag conflict: p/out")
+			_, err = ep.Replace(ctx, nil, logger, "p/ep", "test", &nodeOptions{}, oldEndpoint)
+			require.ErrorContains(t, err, "provider node tag conflict: p/ep")
+
+			if operation == "refresh" {
+				require.NoError(t, subscription.UpdateNodes(nil, nil))
+			} else {
+				require.NoError(t, subscription.Close())
+			}
+			require.Empty(t, subscription.Outbounds())
+			currentOutbound, _ := out.Outbound("p/out")
+			currentEndpoint, _ := ep.Get("p/ep")
+			require.Same(t, newOutbound, currentOutbound)
+			require.Same(t, newEndpoint, currentEndpoint)
+		})
+	}
+}
+
+func newCollisionTestManagers() (context.Context, log.Factory, *outbound.Manager, *endpoint.Manager) {
+	outRegistry, epRegistry := outbound.NewRegistry(), endpoint.NewRegistry()
+	outbound.Register[nodeOptions](outRegistry, "test", func(_ context.Context, _ adapter.Router, _ log.ContextLogger, tag string, _ nodeOptions) (adapter.Outbound, error) {
+		return &testNode{Adapter: outbound.NewAdapter("test", tag, nil, nil)}, nil
+	})
+	endpoint.Register[nodeOptions](epRegistry, "test", func(_ context.Context, _ adapter.Router, _ log.ContextLogger, tag string, _ nodeOptions) (adapter.Endpoint, error) {
+		return &testEndpointNode{testNode: &testNode{Adapter: outbound.NewAdapter("test", tag, nil, nil)}}, nil
+	})
+	ep := endpoint.NewManager(epRegistry)
+	return context.Background(), log.NewNOPFactory(), outbound.NewManager(outRegistry, ep, ""), ep
+}
+
+func collisionTestOptions(kind string, tag string) ([]option.Outbound, []option.Endpoint) {
+	if kind == "outbound" {
+		return []option.Outbound{{Type: "test", Tag: tag, Options: &nodeOptions{}}}, nil
+	}
+	return nil, []option.Endpoint{{Type: "test", Tag: tag, Options: &nodeOptions{}}}
 }

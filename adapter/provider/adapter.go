@@ -186,6 +186,9 @@ func (a *Adapter) Close() error {
 	if a.ticker != nil {
 		a.ticker.Stop()
 	}
+	if a.outbound != nil {
+		defer a.outbound.LockProviderUpdate()()
+	}
 	a.outboundsAccess.Lock()
 	outbounds := a.outbounds
 	endpoints := a.endpoints
@@ -196,14 +199,14 @@ func (a *Adapter) Close() error {
 	a.outboundsAccess.Unlock()
 	var err error
 	for _, ob := range outbounds {
-		if err2 := a.outbound.Remove(ob.Tag()); err2 != nil {
+		if err2 := a.outbound.Remove(ob); err2 != nil {
 			err = E.Append(err, err2, func(err error) error {
 				return E.Cause(err, "close outbound [", ob.Tag(), "]")
 			})
 		}
 	}
 	for _, ep := range endpoints {
-		if err2 := a.endpoint.Remove(ep.Tag()); err2 != nil {
+		if err2 := a.endpoint.Remove(ep); err2 != nil {
 			err = E.Append(err, err2, func(err error) error {
 				return E.Cause(err, "close endpoint [", ep.Tag(), "]")
 			})
