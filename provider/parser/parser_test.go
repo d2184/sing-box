@@ -18,14 +18,14 @@ func TestOverrideDialerOptionPreservesDomainResolver(t *testing.T) {
 	base.DomainResolver = resolver
 	got := overrideDialerOption(base, &option.OverrideDialerOptions{
 		ConnectTimeout: &timeout,
-	}, nil, "")
+	})
 	require.Equal(t, resolver, got.DomainResolver)
 	require.Equal(t, timeout, got.ConnectTimeout)
 
 	newResolver := &option.DomainResolveOptions{Server: "dns-override"}
 	got = overrideDialerOption(base, &option.OverrideDialerOptions{
 		DomainResolver: newResolver,
-	}, nil, "")
+	})
 	require.Equal(t, newResolver, got.DomainResolver)
 }
 

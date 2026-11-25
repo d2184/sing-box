@@ -18,30 +18,29 @@ import (
 )
 
 type Adapter struct {
-	ctx              context.Context
-	cancel           context.CancelFunc
-	workers          sync.WaitGroup
-	closed           bool
-	workerAccess     sync.Mutex
-	outbound         adapter.DynamicOutboundManager
-	endpoint         adapter.DynamicEndpointManager
-	router           adapter.Router
-	logFactory       log.Factory
-	logger           log.ContextLogger
-	providerType     string
-	providerTag      string
-	outboundsAccess  sync.RWMutex
-	outbounds        []adapter.Outbound
-	outboundsByTag   map[string]adapter.Outbound
-	appliedOutbounds map[string]option.Outbound
-	appliedEndpoints map[string]option.Endpoint
-	endpoints        []adapter.Outbound
-	endpointsByTag   map[string]adapter.Outbound
-	ticker           *time.Ticker
-	checking         atomic.Bool
-	history          *urltest.HistoryStorage
-	callbackAccess   sync.Mutex
-	callbacks        list.List[adapter.ProviderUpdateCallback]
+	ctx             context.Context
+	cancel          context.CancelFunc
+	workers         sync.WaitGroup
+	closed          bool
+	workerAccess    sync.Mutex
+	outbound        adapter.DynamicOutboundManager
+	endpoint        adapter.DynamicEndpointManager
+	router          adapter.Router
+	logFactory      log.Factory
+	logger          log.ContextLogger
+	providerType    string
+	providerTag     string
+	outboundsAccess sync.RWMutex
+	outbounds       []adapter.Outbound
+	outboundsByTag  map[string]adapter.Outbound
+	appliedOptions  map[string]nodeConfig
+	endpoints       []adapter.Outbound
+	endpointsByTag  map[string]adapter.Outbound
+	ticker          *time.Ticker
+	checking        atomic.Bool
+	history         *urltest.HistoryStorage
+	callbackAccess  sync.Mutex
+	callbacks       list.List[adapter.ProviderUpdateCallback]
 
 	link     string
 	enabled  bool
@@ -65,17 +64,16 @@ func NewAdapter(ctx context.Context, router adapter.Router, outbound adapter.Out
 	dynamicEndpoint, _ := endpoint.(adapter.DynamicEndpointManager)
 	ctx, cancel := context.WithCancel(ctx)
 	return Adapter{
-		cancel:           cancel,
-		appliedOutbounds: make(map[string]option.Outbound),
-		appliedEndpoints: make(map[string]option.Endpoint),
-		ctx:              ctx,
-		outbound:         dynamicOutbound,
-		endpoint:         dynamicEndpoint,
-		router:           router,
-		logFactory:       logFactory,
-		logger:           logger,
-		providerType:     providerType,
-		providerTag:      providerTag,
+		cancel:         cancel,
+		appliedOptions: make(map[string]nodeConfig),
+		ctx:            ctx,
+		outbound:       dynamicOutbound,
+		endpoint:       dynamicEndpoint,
+		router:         router,
+		logFactory:     logFactory,
+		logger:         logger,
+		providerType:   providerType,
+		providerTag:    providerTag,
 
 		enabled:  options.Enabled,
 		link:     options.URL,
@@ -337,47 +335,6 @@ func (a *Adapter) resolveEndpointTags(newOpts []option.Endpoint) []string {
 		tags[i] = tag
 	}
 	return tags
-}
-
-func (a *Adapter) removeUselessEndpoints(newTags []string) {
-	exists := make(map[string]bool)
-	for _, tag := range newTags {
-		exists[tag] = true
-	}
-	a.outboundsAccess.RLock()
-	snap := make([]adapter.Outbound, len(a.endpoints))
-	copy(snap, a.endpoints)
-	a.outboundsAccess.RUnlock()
-	for _, ep := range snap {
-		tag := ep.Tag()
-		if !exists[tag] {
-			if err := a.endpoint.Remove(tag); err != nil {
-				a.logger.Error(err, "close endpoint [", tag, "]")
-			}
-		}
-	}
-}
-
-func (a *Adapter) removeUseless(newTags []string) {
-	a.outboundsAccess.RLock()
-	if len(a.outbounds) == 0 {
-		a.outboundsAccess.RUnlock()
-		return
-	}
-	exists := make(map[string]bool)
-	for _, tag := range newTags {
-		exists[tag] = true
-	}
-	snap := make([]adapter.Outbound, len(a.outbounds))
-	copy(snap, a.outbounds)
-	a.outboundsAccess.RUnlock()
-	for _, opt := range snap {
-		if !exists[opt.Tag()] {
-			if err := a.outbound.Remove(opt.Tag()); err != nil {
-				a.logger.Error(err, "close outbound [", opt.Tag(), "]")
-			}
-		}
-	}
 }
 
 func (a *Adapter) run(fn func()) {

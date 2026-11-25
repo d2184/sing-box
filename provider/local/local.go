@@ -157,7 +157,7 @@ func (s *ProviderLocal) reloadFile(path string) error {
 	if err != nil {
 		return err
 	}
-	outboundOpts, endpointOpts = parser.ApplyOverrideDialer(outboundOpts, endpointOpts, s.overrideDialer, s.Tag())
+	parser.ApplyOverrideDialer(outboundOpts, endpointOpts, s.overrideDialer, s)
 	updateErr := s.UpdateNodes(outboundOpts, endpointOpts)
 	s.UpdateGroups()
 	if updateErr != nil {
