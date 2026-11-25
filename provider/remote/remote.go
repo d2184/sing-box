@@ -499,7 +499,7 @@ func (s *ProviderRemote) updateProviderFromContent(content string) error {
 	if err != nil {
 		return E.Cause(err, "marshal outbound provider source")
 	}
-	outboundOpts, endpointOpts = parser.ApplyOverrideDialer(outboundOpts, endpointOpts, s.overrideDialer, s.Tag())
+	parser.ApplyOverrideDialer(outboundOpts, endpointOpts, s.overrideDialer, s)
 	outboundOpts, endpointOpts = s.filterOptions(outboundOpts, endpointOpts)
 	updateErr := s.UpdateNodes(outboundOpts, endpointOpts)
 	s.UpdateGroups()

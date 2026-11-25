@@ -489,7 +489,7 @@ func TestProviderRemoteCacheRawNodesAndReloadOptions(t *testing.T) {
 
 func TestProviderRemoteFilteredDetour(t *testing.T) {
 	const subscription = `{"outbounds":[` +
-		`{"type":"socks","tag":"A","server":"127.0.0.1","server_port":1080,"detour":"B"},` +
+		`{"type":"socks","tag":"A","server":"127.0.0.1","server_port":1080,"detour":"prov/B"},` +
 		`{"type":"socks","tag":"B","server":"127.0.0.1","server_port":1081}]}`
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, subscription)
@@ -515,6 +515,37 @@ func TestProviderRemoteFilteredDetour(t *testing.T) {
 	require.ErrorContains(t, err, "provider dependency not found: prov/B")
 	_, found = restored.Outbound("prov/A")
 	require.False(t, found)
+}
+
+func TestProviderRemoteRejectsRemovedDetour(test *testing.T) {
+	const client = `{"type":"socks","tag":"A","server":"127.0.0.1","server_port":1080,"detour":"B"}`
+	const upstream = `{"type":"socks","tag":"B","server":"127.0.0.1","server_port":1081}`
+	var subscription atomic.Value
+	subscription.Store(`{"outbounds":[` + client + `,` + upstream + `]}`)
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(response, subscription.Load().(string))
+	}))
+	test.Cleanup(server.Close)
+	cache := &subscriptionCacheStub{}
+	provider, detours := newCacheTestProvider(cache, server.URL)
+	provider.httpClient = server.Client()
+	fallback := "new-detour"
+	provider.overrideDialer = &option.OverrideDialerOptions{Detour: &fallback}
+	ctx := context.Background()
+	require.NoError(test, provider.fetch(ctx, true))
+	oldNodes, oldCache := provider.Outbounds(), cache.saved
+	require.Equal(test, "prov/B", detours["prov/A"])
+
+	subscription.Store(`{"outbounds":[` + client + `]}`)
+	require.EqualError(test, provider.fetch(ctx, false), "cannot remove provider node [prov/B]: still referenced by [prov/A]")
+	require.Equal(test, oldNodes, provider.Outbounds())
+	require.Same(test, oldCache, cache.saved)
+
+	subscription.Store(`{"outbounds":[` + strings.Replace(client, `"detour":"B"`, `"detour":"external"`, 1) + `]}`)
+	require.NoError(test, provider.fetch(ctx, false))
+	require.Equal(test, fallback, detours["prov/A"])
+	_, found := provider.Outbound("prov/B")
+	require.False(test, found)
 }
 
 func TestProviderRemoteCacheSubscriptionInfo304(t *testing.T) {

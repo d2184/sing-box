@@ -31,6 +31,7 @@ type nodeOptions struct {
 type testNode struct {
 	outbound.Adapter
 	options nodeOptions
+	detour  *dialer.DetourDialer
 	starts  atomic.Int32
 	closes  atomic.Int32
 	access  sync.Mutex
@@ -55,9 +56,12 @@ func (n *testNode) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	}
 	return nil
 }
-func (n *testNode) DialContext(context.Context, string, M.Socksaddr) (net.Conn, error) {
+func (n *testNode) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	if n.closes.Load() != 0 {
 		return nil, net.ErrClosed
+	}
+	if n.detour != nil {
+		return n.detour.DialContext(ctx, network, destination)
 	}
 	client, server := net.Pipe()
 	n.access.Lock()
@@ -157,6 +161,105 @@ func TestProviderHotUpdateKeepsUnchangedNodesAndConnections(t *testing.T) {
 	for _, n := range candidates {
 		require.EqualValues(t, 1, n.closes.Load(), n.Tag())
 	}
+}
+
+type testReferringEndpoint struct {
+	testEndpointNode
+}
+
+func (*testReferringEndpoint) Dependencies() []string {
+	return nil
+}
+
+func (node *testReferringEndpoint) References() ([]string, []string) {
+	return []string{node.options.Detour}, nil
+}
+
+func TestProviderFailedUpdateKeepsOldDependencyChain(test *testing.T) {
+	ctx := context.Background()
+	factory := log.NewNOPFactory()
+	logger := factory.Logger()
+	outboundRegistry, endpointRegistry := outbound.NewRegistry(), endpoint.NewRegistry()
+	endpointManager := endpoint.NewManager(endpointRegistry)
+	outboundManager := outbound.NewManager(outboundRegistry, endpointManager, "")
+	constructed := make(map[string]int)
+	newNode := func(tag string, options nodeOptions) *testNode {
+		constructed[tag]++
+		node := &testNode{Adapter: outbound.NewAdapterWithDialerOptions("test", tag, []string{"tcp"}, options.DialerOptions), options: options}
+		if options.Detour != "" {
+			node.detour = dialer.NewDetour(outboundManager, options.Detour, true).(*dialer.DetourDialer)
+		}
+		return node
+	}
+	outbound.Register[nodeOptions](outboundRegistry, "test", func(_ context.Context, _ adapter.Router, _ log.ContextLogger, tag string, options nodeOptions) (adapter.Outbound, error) {
+		return newNode(tag, options), nil
+	})
+	endpoint.Register[nodeOptions](endpointRegistry, "test", func(_ context.Context, _ adapter.Router, _ log.ContextLogger, tag string, options nodeOptions) (adapter.Endpoint, error) {
+		return &testReferringEndpoint{testEndpointNode{testNode: newNode(tag, options)}}, nil
+	})
+	require.NoError(test, outboundManager.Create(ctx, nil, logger, "static", "test", &nodeOptions{}))
+	scope := adapter.NewScope(ctx, logger)
+	test.Cleanup(func() { require.NoError(test, scope.Close()) })
+	for _, stage := range adapter.ListStartStages {
+		require.NoError(test, scope.Start("endpoint", endpointManager, stage))
+		require.NoError(test, scope.Start("outbound", outboundManager, stage))
+	}
+	subscription := provider.NewAdapter(ctx, nil, outboundManager, endpointManager, factory, logger, "provider", "inline", option.ProviderHealthCheckOptions{})
+	test.Cleanup(func() { require.NoError(test, subscription.Close()) })
+	withDetour := func(tag string) *nodeOptions {
+		return &nodeOptions{DialerOptions: option.DialerOptions{Detour: "provider/" + tag}}
+	}
+	initialOutbounds := []option.Outbound{
+		{Type: "test", Tag: "client", Options: withDetour("bridge")},
+		{Type: "test", Tag: "relay", Options: &nodeOptions{}},
+		{Type: "test", Tag: "obsolete", Options: &nodeOptions{}},
+	}
+	initialEndpoints := []option.Endpoint{{Type: "test", Tag: "bridge", Options: withDetour("relay")}}
+	require.NoError(test, subscription.UpdateNodes(initialOutbounds, initialEndpoints))
+	client, _ := subscription.Outbound("provider/client")
+	bridge, _ := subscription.Outbound("provider/bridge")
+	relay, _ := subscription.Outbound("provider/relay")
+	initialNodes := subscription.Outbounds()
+	require.EqualError(test, subscription.UpdateNodes(initialOutbounds[:1], nil), "cannot remove provider node [provider/bridge]: still referenced by [provider/client]")
+	require.EqualError(test, subscription.UpdateNodes(initialOutbounds[:1], initialEndpoints), "cannot remove provider node [provider/relay]: still referenced by [provider/bridge]")
+	require.Equal(test, initialNodes, subscription.Outbounds())
+
+	nextOutbounds := []option.Outbound{
+		{Type: "test", Tag: "client", Options: &nodeOptions{Fail: true}},
+		{Type: "test", Tag: "dependent", Options: withDetour("client")},
+		{Type: "test", Tag: "independent", Options: &nodeOptions{}},
+	}
+	updateErr := subscription.UpdateNodes(nextOutbounds, nil)
+	require.ErrorContains(test, updateErr, "failed candidate")
+	require.ErrorContains(test, updateErr, "cannot remove provider node [provider/bridge]: still referenced by previous instance of [provider/client]")
+	require.ErrorContains(test, updateErr, "cannot remove provider node [provider/relay]: still referenced by previous instance of [provider/bridge]")
+	retained, _ := subscription.Outbound("provider/client")
+	require.Same(test, client, retained)
+	conn, err := retained.DialContext(ctx, "tcp", M.Socksaddr{})
+	require.NoError(test, err)
+	require.NoError(test, conn.Close())
+	retained, _ = subscription.Outbound("provider/bridge")
+	require.Same(test, bridge, retained)
+	retained, _ = subscription.Outbound("provider/relay")
+	require.Same(test, relay, retained)
+	_, found := outboundManager.Outbound("provider/obsolete")
+	require.False(test, found)
+	require.NotContains(test, constructed, "provider/dependent")
+	independent, found := subscription.Outbound("provider/independent")
+	require.True(test, found)
+	require.Equal(test, []adapter.Outbound{client, independent, relay, bridge}, subscription.Outbounds())
+
+	nextOutbounds[0].Options = &nodeOptions{}
+	require.NoError(test, subscription.UpdateNodes(nextOutbounds, nil))
+	require.Equal(test, 1, constructed["provider/dependent"])
+	for _, tag := range []string{"provider/bridge", "provider/relay"} {
+		_, found = subscription.Outbound(tag)
+		require.False(test, found, tag)
+		_, found = outboundManager.Outbound(tag)
+		require.False(test, found, tag)
+	}
+	require.EqualValues(test, 1, bridge.(*testReferringEndpoint).closes.Load())
+	require.EqualValues(test, 1, relay.(*testNode).closes.Load())
 }
 
 func TestProviderEndpointHotUpdate(t *testing.T) {
@@ -304,14 +407,18 @@ func TestProviderCrossKindReplacementFailurePreservesOldNode(t *testing.T) {
 	factory := log.NewNOPFactory()
 	logger := factory.Logger()
 	outRegistry, epRegistry := outbound.NewRegistry(), endpoint.NewRegistry()
+	epMgr := endpoint.NewManager(epRegistry)
+	outMgr := outbound.NewManager(outRegistry, epMgr, "")
+	var switchDependency adapter.Outbound
 	outbound.Register[nodeOptions](outRegistry, "test", func(_ context.Context, _ adapter.Router, _ log.ContextLogger, tag string, options nodeOptions) (adapter.Outbound, error) {
+		if options.Detour != "" {
+			switchDependency, _ = outMgr.Outbound(options.Detour)
+		}
 		return &testNode{Adapter: outbound.NewAdapter("test", tag, []string{"tcp"}, nil), options: options}, nil
 	})
 	endpoint.Register[nodeOptions](epRegistry, "test", func(_ context.Context, _ adapter.Router, _ log.ContextLogger, tag string, options nodeOptions) (adapter.Endpoint, error) {
 		return &testEndpointNode{testNode: &testNode{Adapter: outbound.NewAdapter("test", tag, []string{"tcp"}, nil), options: options}}, nil
 	})
-	epMgr := endpoint.NewManager(epRegistry)
-	outMgr := outbound.NewManager(outRegistry, epMgr, "")
 	scope := adapter.NewScope(ctx, logger)
 	t.Cleanup(func() { require.NoError(t, scope.Close()) })
 	for _, stage := range adapter.ListStartStages {
@@ -338,9 +445,13 @@ func TestProviderCrossKindReplacementFailurePreservesOldNode(t *testing.T) {
 	require.Same(t, oldOut, p.Outbounds()[0])
 
 	// Switch outbound -> healthy endpoint: new endpoint published, old outbound closed.
-	require.NoError(t, p.UpdateNodes(nil, []option.Endpoint{{Type: "test", Tag: "node", Options: &nodeOptions{Revision: 3}}}))
+	require.NoError(t, p.UpdateNodes(
+		[]option.Outbound{{Type: "test", Tag: "dependent", Options: &nodeOptions{DialerOptions: option.DialerOptions{Detour: "p/node"}}}},
+		[]option.Endpoint{{Type: "test", Tag: "node", Options: &nodeOptions{Revision: 3}}},
+	))
 	newEP, found := epMgr.Get("p/node")
 	require.True(t, found)
+	require.Same(t, newEP, switchDependency)
 	require.EqualValues(t, 1, oldOut.(*testNode).closes.Load())
 	gotAfterSwitch, found := outMgr.Outbound("p/node")
 	require.True(t, found)

@@ -1,7 +1,6 @@
 package provider
 
 import (
-	"maps"
 	"reflect"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -9,12 +8,17 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
+type nodeConfig struct {
+	kind      string
+	sourceTag string
+	options   any
+	endpoint  bool
+}
+
 type updateNode struct {
-	tag      string
-	kind     string
-	options  any
-	outbound *option.Outbound
-	endpoint *option.Endpoint
+	nodeConfig
+	tag          string
+	dependencies []string
 }
 
 // UpdateNodes orders outbounds and endpoints together, so a subscription can
@@ -23,18 +27,148 @@ func (a *Adapter) UpdateNodes(outOpts []option.Outbound, epOpts []option.Endpoin
 	outTags, epTags := a.resolveOutboundTags(outOpts), a.resolveEndpointTags(epOpts)
 	nodes := make(map[string]updateNode, len(outOpts)+len(epOpts))
 	tags := append(append([]string(nil), outTags...), epTags...)
-	for i := range outOpts {
-		opt := &outOpts[i]
-		nodes[outTags[i]] = updateNode{outTags[i], opt.Type, opt.Options, opt, nil}
+	for i, opt := range outOpts {
+		tag := outTags[i]
+		nodes[tag] = updateNode{tag: tag, nodeConfig: nodeConfig{kind: opt.Type, sourceTag: opt.Tag, options: opt.Options}}
 	}
-	for i := range epOpts {
-		opt := &epOpts[i]
-		if _, found := nodes[epTags[i]]; found {
-			return E.New("duplicate provider node tag: ", epTags[i])
+	for i, opt := range epOpts {
+		tag := epTags[i]
+		if _, found := nodes[tag]; found {
+			return E.New("duplicate provider node tag: ", tag)
 		}
-		nodes[epTags[i]] = updateNode{epTags[i], opt.Type, opt.Options, nil, opt}
+		nodes[tag] = updateNode{tag: tag, nodeConfig: nodeConfig{kind: opt.Type, sourceTag: opt.Tag, options: opt.Options, endpoint: true}}
 	}
-	var ordered []updateNode
+	a.outboundsAccess.RLock()
+	previousOutbounds, previousEndpoints := a.outbounds, a.endpoints
+	previousOutByTag, previousEPByTag := a.outboundsByTag, a.endpointsByTag
+	a.outboundsAccess.RUnlock()
+	ordered, err := a.orderNodes(nodes, tags)
+	if err != nil {
+		return err
+	}
+	outByTag, epByTag := make(map[string]adapter.Outbound), make(map[string]adapter.Outbound)
+	failed := make(map[string]bool)
+	var updateErrors []error
+applyNodes:
+	for _, node := range ordered {
+		for _, dependency := range node.dependencies {
+			if failed[dependency] {
+				failed[node.tag] = true
+				updateErrors = append(updateErrors, E.New(node.tag, ": provider dependency failed: ", dependency))
+				continue applyNodes
+			}
+		}
+		ownedOut, ownedEP := previousOutByTag[node.tag], previousEPByTag[node.tag]
+		if ownedOut == nil && ownedEP == nil {
+			if _, exists := a.outbound.Outbound(node.tag); exists {
+				failed[node.tag] = true
+				updateErrors = append(updateErrors, E.New("provider node tag conflicts with existing outbound: ", node.tag))
+				continue
+			}
+			if a.endpoint != nil {
+				if _, exists := a.endpoint.Get(node.tag); exists {
+					failed[node.tag] = true
+					updateErrors = append(updateErrors, E.New("provider node tag conflicts with existing endpoint: ", node.tag))
+					continue
+				}
+			}
+		}
+		var current, previous adapter.Outbound
+		if node.endpoint {
+			current, _ = a.endpoint.Get(node.tag)
+			previous = ownedEP
+		} else {
+			current, _ = a.outbound.Outbound(node.tag)
+			previous = ownedOut
+		}
+		if current == nil || current != previous || !reflect.DeepEqual(node.nodeConfig, a.appliedOptions[node.tag]) {
+			ctx := adapter.WithContext(a.ctx, &adapter.InboundContext{Outbound: node.tag})
+			var replaceErr error
+			if node.endpoint {
+				logger := a.logFactory.NewLogger("endpoint/" + node.kind + "[" + node.tag + "]")
+				replaceErr = a.endpoint.Replace(ctx, a.router, logger, node.tag, node.kind, node.options)
+				current, _ = a.endpoint.Get(node.tag)
+			} else {
+				logger := a.logFactory.NewLogger("outbound/" + node.kind + "[" + node.tag + "]")
+				replaceErr = a.outbound.Replace(ctx, a.router, logger, node.tag, node.kind, node.options)
+				current, _ = a.outbound.Outbound(node.tag)
+			}
+			if replaceErr != nil {
+				updateErrors = append(updateErrors, E.Cause(replaceErr, node.tag))
+				failed[node.tag] = true
+				continue
+			}
+			// Remove the old kind before dependent nodes look up this tag.
+			if node.endpoint && ownedOut != nil {
+				if err := a.outbound.Remove(node.tag); err != nil {
+					a.logger.Error(err, "close outbound [", node.tag, "]")
+				}
+			} else if !node.endpoint && ownedEP != nil {
+				if err := a.endpoint.Remove(node.tag); err != nil {
+					a.logger.Error(err, "close endpoint [", node.tag, "]")
+				}
+			}
+			a.appliedOptions[node.tag] = node.nodeConfig
+		}
+		if node.endpoint {
+			epByTag[node.tag] = current
+		} else {
+			outByTag[node.tag] = current
+		}
+	}
+	var retainPrevious func(tag string, referencedBy string)
+	retainPrevious = func(tag string, referencedBy string) {
+		if outByTag[tag] != nil || epByTag[tag] != nil {
+			return
+		}
+		previous := previousOutByTag[tag]
+		if previous != nil {
+			outByTag[tag] = previous
+		} else if previous = previousEPByTag[tag]; previous != nil {
+			epByTag[tag] = previous
+		} else {
+			return
+		}
+		if _, requested := nodes[tag]; !requested {
+			updateErrors = append(updateErrors, E.New("cannot remove provider node [", tag, "]: still referenced by previous instance of [", referencedBy, "]"))
+		}
+		for _, dependency := range previous.Dependencies() {
+			retainPrevious(dependency, tag)
+		}
+		if referrer, ok := previous.(adapter.Referrer); ok {
+			references, _ := referrer.References()
+			for _, reference := range references {
+				retainPrevious(reference, tag)
+			}
+		}
+	}
+	for _, tag := range tags {
+		if failed[tag] {
+			retainPrevious(tag, "")
+		}
+	}
+	outbounds := a.reconcileNodes(outTags, previousOutbounds, outByTag, epByTag, a.outbound.Remove)
+	var endpoints []adapter.Outbound
+	if a.endpoint != nil {
+		endpoints = a.reconcileNodes(epTags, previousEndpoints, epByTag, outByTag, a.endpoint.Remove)
+	}
+	a.outboundsAccess.Lock()
+	a.outbounds, a.outboundsByTag = outbounds, outByTag
+	a.endpoints, a.endpointsByTag = endpoints, epByTag
+	a.outboundsAccess.Unlock()
+	for tag := range a.appliedOptions {
+		if outByTag[tag] == nil && epByTag[tag] == nil {
+			delete(a.appliedOptions, tag)
+		}
+	}
+	if a.enabled && a.history != nil {
+		a.run(func() { a.HealthCheck(a.ctx) })
+	}
+	return E.Errors(updateErrors...)
+}
+
+func (a *Adapter) orderNodes(nodes map[string]updateNode, tags []string) ([]updateNode, error) {
+	ordered := make([]updateNode, 0, len(nodes))
 	visiting, visited := make(map[string]bool), make(map[string]bool)
 	var visit func(string) error
 	visit = func(tag string) error {
@@ -46,34 +180,29 @@ func (a *Adapter) UpdateNodes(outOpts []option.Outbound, epOpts []option.Endpoin
 		}
 		visiting[tag] = true
 		node := nodes[tag]
-		var dependencies []string
 		if opts, ok := node.options.(option.DialerOptionsWrapper); ok {
 			if detour := opts.TakeDialerOptions().Detour; detour != "" {
-				dependencies = append(dependencies, detour)
+				node.dependencies = append(node.dependencies, detour)
 			}
 		}
 		switch opts := node.options.(type) {
 		case *option.SelectorOutboundOptions:
-			dependencies = append(dependencies, opts.Outbounds...)
+			node.dependencies = append(node.dependencies, opts.Outbounds...)
 		case *option.URLTestOutboundOptions:
-			dependencies = append(dependencies, opts.Outbounds...)
+			node.dependencies = append(node.dependencies, opts.Outbounds...)
 		}
-		for _, dep := range dependencies {
-			if _, internal := nodes[dep]; internal {
-				if err := visit(dep); err != nil {
+		for _, dependency := range node.dependencies {
+			if _, internal := nodes[dependency]; internal {
+				if err := visit(dependency); err != nil {
 					return err
 				}
-			} else {
-				if _, found := a.outbound.Outbound(dep); !found {
-					return E.New("provider dependency not found: ", dep)
-				}
-				// An old subscription node scheduled for removal is not a usable dependency.
-				if _, owned := a.appliedOutbounds[dep]; owned {
-					return E.New("provider dependency removed: ", dep)
-				}
-				if _, owned := a.appliedEndpoints[dep]; owned {
-					return E.New("provider dependency removed: ", dep)
-				}
+				continue
+			}
+			if _, found := a.outbound.Outbound(dependency); !found {
+				return E.New("provider dependency not found: ", dependency, " (referenced by ", tag, ")")
+			}
+			if _, owned := a.appliedOptions[dependency]; owned {
+				return E.New("cannot remove provider node [", dependency, "]: still referenced by [", tag, "]")
 			}
 		}
 		visiting[tag] = false
@@ -83,129 +212,32 @@ func (a *Adapter) UpdateNodes(outOpts []option.Outbound, epOpts []option.Endpoin
 	}
 	for _, tag := range tags {
 		if err := visit(tag); err != nil {
-			return err
+			return nil, err
 		}
 	}
-	a.outboundsAccess.RLock()
-	activeOut := maps.Clone(a.outboundsByTag)
-	activeEP := maps.Clone(a.endpointsByTag)
-	a.outboundsAccess.RUnlock()
-	outByTag, epByTag := make(map[string]adapter.Outbound), make(map[string]adapter.Outbound)
-	var retainedOutTags, retainedEPTags []string
-	var updateErr error
-	for _, node := range ordered {
-		ctx := adapter.WithContext(a.ctx, &adapter.InboundContext{Outbound: node.tag})
-		ownedOut := activeOut[node.tag]
-		ownedEP := activeEP[node.tag]
-		if ownedOut == nil && ownedEP == nil {
-			if _, exists := a.outbound.Outbound(node.tag); exists {
-				updateErr = E.Errors(updateErr, E.New("provider node tag conflicts with existing outbound: ", node.tag))
-				continue
-			}
-			if a.endpoint != nil {
-				if _, exists := a.endpoint.Get(node.tag); exists {
-					updateErr = E.Errors(updateErr, E.New("provider node tag conflicts with existing endpoint: ", node.tag))
-					continue
+	return ordered, nil
+}
+
+func (a *Adapter) reconcileNodes(tags []string, previous []adapter.Outbound, selected, switched map[string]adapter.Outbound, remove func(string) error) []adapter.Outbound {
+	ordered := make([]adapter.Outbound, 0, len(selected))
+	listed := make(map[string]bool, len(tags))
+	for _, tag := range tags {
+		if node := selected[tag]; node != nil {
+			ordered = append(ordered, node)
+			listed[tag] = true
+		}
+	}
+	for _, old := range previous {
+		tag := old.Tag()
+		if node := selected[tag]; node == nil {
+			if switched[tag] == nil {
+				if err := remove(tag); err != nil {
+					a.logger.Error(err, "close provider node [", tag, "]")
 				}
 			}
-		}
-		if node.outbound != nil {
-			if ownedOut != nil && reflect.DeepEqual(*node.outbound, a.appliedOutbounds[node.tag]) {
-				outByTag[node.tag] = ownedOut
-				continue
-			}
-			err := a.outbound.Replace(ctx, a.router, a.logFactory.NewLogger("outbound/"+node.kind+"["+node.tag+"]"), node.tag, node.kind, node.options)
-			if err != nil {
-				updateErr = E.Errors(updateErr, E.Cause(err, node.tag))
-				if ownedOut != nil {
-					outByTag[node.tag] = ownedOut
-				} else if ownedEP != nil {
-					epByTag[node.tag] = ownedEP
-					retainedEPTags = append(retainedEPTags, node.tag)
-				}
-				continue
-			}
-			if ownedEP != nil {
-				if removeErr := a.endpoint.Remove(node.tag); removeErr != nil {
-					a.logger.Error(removeErr, "close endpoint [", node.tag, "]")
-				}
-			}
-			current, _ := a.outbound.Outbound(node.tag)
-			a.appliedOutbounds[node.tag] = *node.outbound
-			outByTag[node.tag] = current
-		} else {
-			if ownedEP != nil && reflect.DeepEqual(*node.endpoint, a.appliedEndpoints[node.tag]) {
-				epByTag[node.tag] = ownedEP
-				continue
-			}
-			err := a.endpoint.Replace(ctx, a.router, a.logFactory.NewLogger("endpoint/"+node.kind+"["+node.tag+"]"), node.tag, node.kind, node.options)
-			if err != nil {
-				updateErr = E.Errors(updateErr, E.Cause(err, node.tag))
-				if ownedEP != nil {
-					epByTag[node.tag] = ownedEP
-				} else if ownedOut != nil {
-					outByTag[node.tag] = ownedOut
-					retainedOutTags = append(retainedOutTags, node.tag)
-				}
-				continue
-			}
-			if ownedOut != nil {
-				if removeErr := a.outbound.Remove(node.tag); removeErr != nil {
-					a.logger.Error(removeErr, "close outbound [", node.tag, "]")
-				}
-			}
-			current, _ := a.endpoint.Get(node.tag)
-			a.appliedEndpoints[node.tag] = *node.endpoint
-			epByTag[node.tag] = current
+		} else if !listed[tag] {
+			ordered = append(ordered, node)
 		}
 	}
-	keepOutTags := make([]string, 0, len(outByTag))
-	for tag := range outByTag {
-		keepOutTags = append(keepOutTags, tag)
-	}
-	keepEPTags := make([]string, 0, len(epByTag))
-	for tag := range epByTag {
-		keepEPTags = append(keepEPTags, tag)
-	}
-	a.removeUseless(keepOutTags)
-	a.removeUselessEndpoints(keepEPTags)
-	var outbounds, endpoints []adapter.Outbound
-	for _, tag := range outTags {
-		if node := outByTag[tag]; node != nil {
-			outbounds = append(outbounds, node)
-		}
-	}
-	for _, tag := range retainedOutTags {
-		if node := outByTag[tag]; node != nil {
-			outbounds = append(outbounds, node)
-		}
-	}
-	for _, tag := range epTags {
-		if node := epByTag[tag]; node != nil {
-			endpoints = append(endpoints, node)
-		}
-	}
-	for _, tag := range retainedEPTags {
-		if node := epByTag[tag]; node != nil {
-			endpoints = append(endpoints, node)
-		}
-	}
-	a.outboundsAccess.Lock()
-	a.outbounds, a.outboundsByTag = outbounds, outByTag
-	a.endpoints, a.endpointsByTag = endpoints, epByTag
-	a.outboundsAccess.Unlock()
-	for tag := range a.appliedOutbounds {
-		if _, found := outByTag[tag]; !found {
-			delete(a.appliedOutbounds, tag)
-		}
-	}
-	for tag := range a.appliedEndpoints {
-		if _, found := epByTag[tag]; !found {
-			delete(a.appliedEndpoints, tag)
-		}
-	}
-	if a.enabled && a.history != nil {
-		a.run(func() { a.HealthCheck(a.ctx) })
-	}
-	return updateErr
+	return ordered
 }
