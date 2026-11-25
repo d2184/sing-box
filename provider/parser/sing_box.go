@@ -22,38 +22,34 @@ func (o *SingBoxDocument) UnmarshalJSONContext(ctx context.Context, inputContent
 	if err != nil {
 		return err
 	}
-	outbounds, hasOutbounds := content.Get("outbounds")
-	if hasOutbounds {
-		if outbounds == nil {
-			content.Put("outbounds", nil)
-		} else {
-			outboundArray, isArray := outbounds.(badjson.JSONArray)
-			if !isArray {
-				return E.New("invalid outbounds: expected array")
-			}
-			var outs badjson.JSONArray
-			for i, outbound := range outboundArray {
-				outboundObj, isObject := outbound.(*badjson.JSONObject)
-				if !isObject || outboundObj == nil {
-					return E.New("invalid outbound[", i, "]: expected object")
-				}
-				typeVal, loaded := outboundObj.Get("type")
-				if !loaded {
-					return E.New("missing type in outbound[", i, "]")
-				}
-				typeStr, isString := typeVal.(string)
-				if !isString {
-					return E.New("invalid type in outbound[", i, "]: expected string")
-				}
-				switch typeStr {
-				case C.TypeDirect, C.TypeBlock, C.TypeDNS, C.TypeSelector, C.TypeURLTest:
-					continue
-				default:
-					outs = append(outs, outbound)
-				}
-			}
-			content.Put("outbounds", outs)
+	rawOutbounds, hasOutbounds := content.Get("outbounds")
+	if hasOutbounds && rawOutbounds != nil {
+		outbounds, ok := rawOutbounds.(badjson.JSONArray)
+		if !ok {
+			return E.New("outbounds must be an array")
 		}
+		var filteredOutbounds badjson.JSONArray
+		for index, rawOutbound := range outbounds {
+			outbound, ok := rawOutbound.(*badjson.JSONObject)
+			if !ok || outbound == nil {
+				return E.New("outbounds[", index, "] must be an object")
+			}
+			rawType, loaded := outbound.Get("type")
+			if !loaded {
+				return E.New("missing type in outbounds[", index, "]")
+			}
+			outboundType, ok := rawType.(string)
+			if !ok {
+				return E.New("outbounds[", index, "].type must be a string")
+			}
+			switch outboundType {
+			case C.TypeDirect, C.TypeBlock, C.TypeDNS, C.TypeSelector, C.TypeURLTest:
+				continue
+			default:
+				filteredOutbounds = append(filteredOutbounds, outbound)
+			}
+		}
+		content.Put("outbounds", filteredOutbounds)
 	}
 	inputContent, err = content.MarshalJSONContext(ctx)
 	if err != nil {
