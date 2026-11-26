@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"regexp"
 	"sync/atomic"
@@ -17,8 +18,10 @@ import (
 	"github.com/sagernet/sing-box/adapter/outbound"
 	providerAdapter "github.com/sagernet/sing-box/adapter/provider"
 	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/experimental/cachefile"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/protocol/socks"
 	"github.com/sagernet/sing-box/protocol/trojan"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/json/badoption"
@@ -331,4 +334,64 @@ func TestProviderRemoteLegacyProcessedCacheForcesUnconditionalRefresh(t *testing
 	require.NoError(t, p.fetch(ctx, false))
 	require.False(t, captured["sub/alpha"].TLS.Insecure)
 	require.Equal(t, `"old-etag"`, p.lastEtag)
+}
+
+func TestProviderRemotePathCacheHash(t *testing.T) {
+	t.Parallel()
+
+	const etag = `"test"`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("subscription-userinfo", "upload=123")
+		w.Header().Set("ETag", etag)
+		_, _ = io.WriteString(w, `{"outbounds":[{"type":"socks","tag":"node","server":"127.0.0.1","server_port":1080}]}`)
+	}))
+	t.Cleanup(server.Close)
+
+	registry := outbound.NewRegistry()
+	socks.RegisterOutbound(registry)
+	ctx := service.ContextWith[option.OutboundOptionsRegistry](t.Context(), registry)
+	logFactory := log.NewNOPFactory()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "subscription.json")
+	cacheOptions := option.CacheFileOptions{Path: filepath.Join(dir, "cache.db")}
+	openCache := func() (*cachefile.CacheFile, *adapter.Scope) {
+		t.Helper()
+		cache := cachefile.New(ctx, logFactory.Logger(), cacheOptions)
+		scope := adapter.NewScope(ctx, logFactory.Logger())
+		t.Cleanup(func() { require.NoError(t, scope.Close()) })
+		require.NoError(t, cache.Start(adapter.StartStateInitialize, scope))
+		return cache, scope
+	}
+	newProvider := func(cache *cachefile.CacheFile) *ProviderRemote {
+		t.Helper()
+		endpointManager := endpoint.NewManager(endpoint.NewRegistry())
+		providerCtx := service.ContextWith[adapter.EndpointManager](ctx, endpointManager)
+		providerCtx = service.ContextWith[adapter.OutboundManager](providerCtx, outbound.NewManager(registry, endpointManager, ""))
+		provider, err := NewProviderRemote(providerCtx, nil, logFactory, "test", option.ProviderRemoteOptions{URL: server.URL, Path: path})
+		require.NoError(t, err)
+		remote := provider.(*ProviderRemote)
+		t.Cleanup(func() { require.NoError(t, remote.Close()) })
+		remote.cacheFile = cache
+		remote.httpClient = server.Client()
+		return remote
+	}
+
+	cache, scope := openCache()
+	require.NoError(t, newProvider(cache).fetch(ctx, true))
+	require.NoError(t, scope.Close())
+	cache, _ = openCache()
+
+	provider := newProvider(cache)
+	loaded, err := provider.loadCacheFile()
+	require.NoError(t, err)
+	require.True(t, loaded)
+	require.Equal(t, etag, provider.lastEtag)
+	require.EqualValues(t, 123, provider.SubscriptionInfo().Upload)
+
+	content, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, append(content, '\n'), 0o600))
+	loaded, err = newProvider(cache).loadCacheFile()
+	require.ErrorContains(t, err, "validation failed")
+	require.False(t, loaded)
 }
