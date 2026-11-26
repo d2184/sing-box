@@ -53,7 +53,7 @@ type CacheFile interface {
 }
 
 type SavedBinary struct {
-	// Hash is stored only by the branch-private cache envelope.
+	// Hash verifies subscription content stored outside the cache database.
 	Hash        hash.HashType
 	Content     []byte
 	LastUpdated time.Time
@@ -92,6 +92,10 @@ func (s *SavedBinary) MarshalBinary() ([]byte, error) {
 		return nil, err
 	}
 	_, err = buffer.Write(s.URLHash)
+	if err != nil {
+		return nil, err
+	}
+	_, err = buffer.Write(s.Hash.Bytes())
 	if err != nil {
 		return nil, err
 	}
@@ -152,7 +156,7 @@ func (s *SavedBinary) UnmarshalBinary(data []byte) error {
 	if err != nil {
 		return err
 	}
-	return nil
+	return s.Hash.UnmarshalBinary(data[len(data)-reader.Len():])
 }
 
 type OutboundGroup interface {
